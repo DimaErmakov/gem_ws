@@ -30,24 +30,9 @@
       </visual>
     </link>
 
-    <link name="${imu_link}" />
-
-    <link name="${lidar_link}" />
-
-
-    <joint name="${name}_imu_link_joint" type="fixed">
-      <parent link="${name}" />
-      <child link="${imu_link}" />
-      <origin xyz="0.006253 -0.011775 0.007645" rpy="0 0 0" />
-    </joint>
-    <gazebo reference="${imu_link}">
-    </gazebo>
-
-    <joint name="${name}_lidar_link_joint" type="fixed">
-      <parent link="${name}" />
-      <child link="${lidar_link}" />
-      <origin xyz="0.0 0.0 0.03618" rpy="0 0 0" />
-    </joint>
+    <!-- ${lidar_link} and ${imu_link} are not defined here: the Ouster driver
+         publishes ${name} -> ${lidar_link}/${imu_link} on /tf_static from the
+         sensor's factory metadata, and a second URDF copy would conflict. -->
 
     <!-- Gazebo requires the ouster_gazebo_plugins package -->
     <gazebo reference="${name}">

@@ -2,6 +2,9 @@
 password:
 gem_ros2
 
+# Wiki Page
+Check the [wiki page](https://github.com/UIUC-Robotics/gem_ws/wiki) before proceeding with the setup and usage of the GEM car
+
 # compile workspace
 ```bash
 cd ~/gem_ws
