@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
-#================================================================
+# ================================================================
 # File name: pure_pursuit_ros2.py
 # Description: GNSS waypoints tracker using PID and pure pursuit in ROS2
 # Author: Zillur Rahman, Jiaming Zhang, Hang Cui
 # Date: 2026-09-03
-#================================================================
+# ================================================================
 
 import os
 import csv
@@ -20,7 +20,16 @@ import rclpy
 from rclpy.node import Node
 
 from std_msgs.msg import Bool, Float32
-from pacmod2_msgs.msg import PositionWithSpeed, VehicleSpeedRpt, GlobalCmd, SystemCmdFloat, SystemCmdInt, GlobalRpt, SystemRptFloat, SystemRptInt
+from pacmod2_msgs.msg import (
+    PositionWithSpeed,
+    VehicleSpeedRpt,
+    GlobalCmd,
+    SystemCmdFloat,
+    SystemCmdInt,
+    GlobalRpt,
+    SystemRptFloat,
+    SystemRptInt,
+)
 from sensor_msgs.msg import NavSatFix
 from septentrio_gnss_driver.msg import INSNavGeod
 from nav_msgs.msg import Odometry
@@ -72,7 +81,7 @@ class OnlineFilter:
     def __init__(self, cutoff, fs, order):
         nyq = 0.5 * fs
         normal_cutoff = cutoff / nyq
-        self.b, self.a = signal.butter(order, normal_cutoff, btype='low', analog=False)
+        self.b, self.a = signal.butter(order, normal_cutoff, btype="low", analog=False)
         self.z = signal.lfilter_zi(self.b, self.a)
 
     def get_data(self, data):
@@ -86,20 +95,20 @@ def quaternion_from_yaw(yaw):
 
 class PurePursuit(Node):
     def __init__(self):
-        super().__init__('pure_pursuit_node')
+        super().__init__("pure_pursuit_node")
         # Declare parameters with default values
-        self.declare_parameter('vehicle_name', "e2")
-        self.declare_parameter('rate_hz', 20)
-        self.declare_parameter('look_ahead', 5.0)
-        self.declare_parameter('wheelbase', 2.57)
-        self.declare_parameter('offset', 1.26)
-        self.declare_parameter('origin_lat', 40.0927422)
-        self.declare_parameter('origin_lon', -88.2359639)
-        self.declare_parameter('desired_speed', 2.6)
-        self.declare_parameter('max_accel', 0.5)
-        self.declare_parameter('waypoints_file', 'track.csv')
-        self.declare_parameter('stop_distance', 2.0)
-        
+        self.declare_parameter("vehicle_name", "e2")
+        self.declare_parameter("rate_hz", 20)
+        self.declare_parameter("look_ahead", 5.0)
+        self.declare_parameter("wheelbase", 2.57)
+        self.declare_parameter("offset", 1.26)
+        self.declare_parameter("origin_lat", 40.0927422)
+        self.declare_parameter("origin_lon", -88.2359639)
+        self.declare_parameter("desired_speed", 2.6)
+        self.declare_parameter("max_accel", 0.5)
+        self.declare_parameter("waypoints_file", "track.csv")
+        self.declare_parameter("stop_distance", 2.0)
+
         ## E2-specific kick-start parameters
         # Static-friction "kick-start": a single high accel command isn't held
         # long enough (one 50ms tick before the next control_loop call
@@ -107,84 +116,111 @@ class PurePursuit(Node):
         # overcome stiction from a dead stop. Empirically (E2 testing),
         # holding ~0.3 continuously for ~1s is what's needed; once rolling,
         # the normal PID-computed accel works fine.
-        self.declare_parameter('kick_start_accel', 0.3)
-        self.declare_parameter('kick_start_duration', 1.0)
-        self.declare_parameter('kick_start_speed_threshold', 0.15)
+        self.declare_parameter("kick_start_accel", 0.3)
+        self.declare_parameter("kick_start_duration", 1.0)
+        self.declare_parameter("kick_start_speed_threshold", 0.15)
 
-        self.declare_parameter('pid/kp', 0.6)
-        self.declare_parameter('pid/ki', 0.0)
-        self.declare_parameter('pid/kd', 0.1)
-        self.declare_parameter('pid/wg', 10)
+        self.declare_parameter("pid/kp", 0.6)
+        self.declare_parameter("pid/ki", 0.0)
+        self.declare_parameter("pid/kd", 0.1)
+        self.declare_parameter("pid/wg", 10)
 
-        self.declare_parameter('filter/cutoff', 1.2)
-        self.declare_parameter('filter/fs', 30)
-        self.declare_parameter('filter/order', 4)
-        
-        vehicle_name=self.get_parameter('vehicle_name').value
-        if (vehicle_name==""):
-            self.get_logger().warn("No vehicle_name parameter found. No config file loaded, defaulting to 'e4' parameters.")
+        self.declare_parameter("filter/cutoff", 1.2)
+        self.declare_parameter("filter/fs", 30)
+        self.declare_parameter("filter/order", 4)
+
+        vehicle_name = self.get_parameter("vehicle_name").value
+        if vehicle_name == "":
+            self.get_logger().warn(
+                "No vehicle_name parameter found. No config file loaded, defaulting to 'e4' parameters."
+            )
         else:
             self.get_logger().info(f"Using vehicle config: {vehicle_name}")
 
-        self.vehicle_name = self.get_parameter('vehicle_name').value
-        self.rate_hz = self.get_parameter('rate_hz').value
-        self.look_ahead = self.get_parameter('look_ahead').value
-        self.wheelbase = self.get_parameter('wheelbase').value
-        self.offset = self.get_parameter('offset').value
-        self.olat = self.get_parameter('origin_lat').value
-        self.olon = self.get_parameter('origin_lon').value
-        self.stop_dist_threshold = self.get_parameter('stop_distance').value
-        self.kick_start_accel = self.get_parameter('kick_start_accel').value
-        self.kick_start_duration = self.get_parameter('kick_start_duration').value
-        self.kick_start_speed_threshold = self.get_parameter('kick_start_speed_threshold').value
+        self.vehicle_name = self.get_parameter("vehicle_name").value
+        self.rate_hz = self.get_parameter("rate_hz").value
+        self.look_ahead = self.get_parameter("look_ahead").value
+        self.wheelbase = self.get_parameter("wheelbase").value
+        self.offset = self.get_parameter("offset").value
+        self.olat = self.get_parameter("origin_lat").value
+        self.olon = self.get_parameter("origin_lon").value
+        self.stop_dist_threshold = self.get_parameter("stop_distance").value
+        self.kick_start_accel = self.get_parameter("kick_start_accel").value
+        self.kick_start_duration = self.get_parameter("kick_start_duration").value
+        self.kick_start_speed_threshold = self.get_parameter(
+            "kick_start_speed_threshold"
+        ).value
 
-        self.desired_speed = min(5.0,self.get_parameter('desired_speed').value) # desired speed capped at 5 m/s
-        self.max_accel = min(2.0, self.get_parameter('max_accel').value) # max acceleration capped at 2 m/s^2
+        self.desired_speed = min(
+            5.0, self.get_parameter("desired_speed").value
+        )  # desired speed capped at 5 m/s
+        self.max_accel = min(
+            2.0, self.get_parameter("max_accel").value
+        )  # max acceleration capped at 2 m/s^2
         self.pid_speed = PID(
-            kp=self.get_parameter('pid/kp').value,
-            ki=self.get_parameter('pid/ki').value,
-            kd=self.get_parameter('pid/kd').value,
-            wg=self.get_parameter('pid/wg').value
-            )
+            kp=self.get_parameter("pid/kp").value,
+            ki=self.get_parameter("pid/ki").value,
+            kd=self.get_parameter("pid/kd").value,
+            wg=self.get_parameter("pid/wg").value,
+        )
         self.speed_filter = OnlineFilter(
-            cutoff=self.get_parameter('filter/cutoff').value,
-            fs=self.get_parameter('filter/fs').value,
-            order=self.get_parameter('filter/order').value,)
+            cutoff=self.get_parameter("filter/cutoff").value,
+            fs=self.get_parameter("filter/fs").value,
+            order=self.get_parameter("filter/order").value,
+        )
 
         self.goal = 0
 
         # Subscriptions
-        self.create_subscription(NavSatFix, '/navsatfix', self.gnss_callback, 10)
-        self.create_subscription(INSNavGeod, '/insnavgeod', self.ins_callback, 10)
-        self.create_subscription(Bool, '/pacmod/enabled', self.enable_callback, 10)
-        self.create_subscription(VehicleSpeedRpt, '/pacmod/vehicle_speed_rpt', self.speed_callback, 10)
-        self.create_subscription(SystemRptFloat, '/pacmod/brake_rpt', self.brake_rpt_callback, 10)
+        self.create_subscription(NavSatFix, "/navsatfix", self.gnss_callback, 10)
+        self.create_subscription(INSNavGeod, "/insnavgeod", self.ins_callback, 10)
+        self.create_subscription(Bool, "/pacmod/enabled", self.enable_callback, 10)
+        self.create_subscription(
+            VehicleSpeedRpt, "/pacmod/vehicle_speed_rpt", self.speed_callback, 10
+        )
+        self.create_subscription(
+            SystemRptFloat, "/pacmod/brake_rpt", self.brake_rpt_callback, 10
+        )
         self.current_brake = 0.0
-        self.create_subscription(SystemRptInt, '/pacmod/shift_rpt', self.shift_rpt_callback, 10)
+        self.create_subscription(
+            SystemRptInt, "/pacmod/shift_rpt", self.shift_rpt_callback, 10
+        )
         self.current_gear = 2
-        
-        self.create_subscription(Float32, '/joystick/brake_value', self.brake_callback, 10)
+
+        self.create_subscription(
+            Float32, "/joystick/brake_value", self.brake_callback, 10
+        )
         self.pacmod_override_active = False
-        self.create_subscription(GlobalRpt, '/pacmod/global_rpt', self.global_rpt_callback, 10)
+        self.create_subscription(
+            GlobalRpt, "/pacmod/global_rpt", self.global_rpt_callback, 10
+        )
 
         # Publishers
-        self.global_pub = self.create_publisher(GlobalCmd, '/pacmod/global_cmd', 10)
-        self.gear_pub = self.create_publisher(SystemCmdInt, '/pacmod/shift_cmd', 10)
-        self.brake_pub = self.create_publisher(SystemCmdFloat, '/pacmod/brake_cmd', 10)
-        self.accel_pub = self.create_publisher(SystemCmdFloat, '/pacmod/accel_cmd', 10)
-        self.turn_pub = self.create_publisher(SystemCmdInt, '/pacmod/turn_cmd', 10)
-        self.steer_pub = self.create_publisher(PositionWithSpeed, '/pacmod/steering_cmd', 10)
+        self.global_pub = self.create_publisher(GlobalCmd, "/pacmod/global_cmd", 10)
+        self.gear_pub = self.create_publisher(SystemCmdInt, "/pacmod/shift_cmd", 10)
+        self.brake_pub = self.create_publisher(SystemCmdFloat, "/pacmod/brake_cmd", 10)
+        self.accel_pub = self.create_publisher(SystemCmdFloat, "/pacmod/accel_cmd", 10)
+        self.turn_pub = self.create_publisher(SystemCmdInt, "/pacmod/turn_cmd", 10)
+        self.steer_pub = self.create_publisher(
+            PositionWithSpeed, "/pacmod/steering_cmd", 10
+        )
 
-        self.local_odom_pub = self.create_publisher(Odometry, '/gem/local_odom', 10)
-        self.target_point_pub = self.create_publisher(PointStamped, '/pure_pursuit/target_point', 10)
+        self.local_odom_pub = self.create_publisher(Odometry, "/gem/local_odom", 10)
+        self.target_point_pub = self.create_publisher(
+            PointStamped, "/pure_pursuit/target_point", 10
+        )
 
         # Commands
-        self.global_cmd = GlobalCmd(enable=False, clear_override = True, ignore_override = False)
+        self.global_cmd = GlobalCmd(
+            enable=False, clear_override=True, ignore_override=False
+        )
         self.gear_cmd = SystemCmdInt(command=2)  # NEUTRAL
         self.brake_cmd = SystemCmdFloat(command=0.0)
         self.accel_cmd = SystemCmdFloat(command=0.0)
-        self.turn_cmd = SystemCmdInt(command=1) # no signal
-        self.steer_cmd = PositionWithSpeed(angular_position=0.0, angular_velocity_limit=4.0)
+        self.turn_cmd = SystemCmdInt(command=1)  # no signal
+        self.steer_cmd = PositionWithSpeed(
+            angular_position=0.0, angular_velocity_limit=4.0
+        )
 
         self.read_waypoints()
 
@@ -227,8 +263,9 @@ class PurePursuit(Node):
             # Operator physically grabbed the steering wheel/brake/accelerator.
             self.global_cmd.enable = False
             self.get_logger().warn(
-                'Manual override detected on PACMod - disengaging autonomous control',
-                throttle_duration_sec=1.0)
+                "Manual override detected on PACMod - disengaging autonomous control",
+                throttle_duration_sec=1.0,
+            )
             self.gear_cmd.command = 2  # NEUTRAL
             self.gear_pub.publish(self.gear_cmd)
 
@@ -244,7 +281,7 @@ class PurePursuit(Node):
         self.current_gear = msg.output
 
     def read_waypoints(self):
-        waypoints_file = self.get_parameter('waypoints_file').value
+        waypoints_file = self.get_parameter("waypoints_file").value
         if os.path.isabs(waypoints_file):
             filename = waypoints_file
         else:
@@ -254,7 +291,7 @@ class PurePursuit(Node):
             # (src/.../gem_gnss_control/waypoints) instead of a copy inside
             # build/ or install/.
             dirname = os.path.dirname(os.path.realpath(__file__))
-            filename = os.path.join(dirname, '../waypoints', waypoints_file)
+            filename = os.path.join(dirname, "../waypoints", waypoints_file)
         self.get_logger().info(f"Loading waypoints from: {filename}")
         with open(filename) as f:
             path_points = [tuple(line) for line in csv.reader(f)]
@@ -276,7 +313,7 @@ class PurePursuit(Node):
     def front2steer(self, f_angle):
         f_angle = max(min(f_angle, 35), -35)
         angle = abs(f_angle)
-        steer_angle = -0.1084 * angle ** 2 + 21.775 * angle
+        steer_angle = -0.1084 * angle**2 + 21.775 * angle
         return round(steer_angle if f_angle >= 0 else -steer_angle, 2)
 
     def check_joystick_enable(self):
@@ -308,8 +345,8 @@ class PurePursuit(Node):
     def publish_local_odom(self, x, y, yaw):
         odom = Odometry()
         odom.header.stamp = self.get_clock().now().to_msg()
-        odom.header.frame_id = 'map'
-        odom.child_frame_id = 'base_link'
+        odom.header.frame_id = "map"
+        odom.child_frame_id = "base_link"
         odom.pose.pose.position.x = x
         odom.pose.pose.position.y = y
         qx, qy, qz, qw = quaternion_from_yaw(yaw)
@@ -323,7 +360,7 @@ class PurePursuit(Node):
     def publish_target_point(self, x, y):
         pt = PointStamped()
         pt.header.stamp = self.get_clock().now().to_msg()
-        pt.header.frame_id = 'map'
+        pt.header.frame_id = "map"
         pt.point.x = x
         pt.point.y = y
         self.target_point_pub.publish(pt)
@@ -335,7 +372,7 @@ class PurePursuit(Node):
         self.publish_local_odom(curr_x, curr_y, curr_yaw)
 
         if joy_enable == 1 and not self.pacmod_enable:
-            # joystick enable when vehicle disbaled 
+            # joystick enable when vehicle disbaled
             self.global_cmd.enable = True
             self.global_cmd.clear_override = True
             self.global_pub.publish(self.global_cmd)
@@ -348,8 +385,10 @@ class PurePursuit(Node):
 
             self.turn_cmd.command = 3
             self.turn_pub.publish(self.turn_cmd)
-            
-            self.get_logger().warn('Joystick enabled, Pacmod enabled, forward gear engaged')
+
+            self.get_logger().warn(
+                "Joystick enabled, Pacmod enabled, forward gear engaged"
+            )
 
         elif joy_enable == 0 and self.pacmod_enable:
             # joystick disable when vehicle enbaled
@@ -357,12 +396,12 @@ class PurePursuit(Node):
 
             self.turn_cmd.command = 1
             self.turn_pub.publish(self.turn_cmd)
-            
+
             self.gear_cmd.command = 2
             self.gear_pub.publish(self.gear_cmd)
-            
+
             self.global_pub.publish(self.global_cmd)
-            self.get_logger().warn('Joystick Disabled, Pacmod disabled')
+            self.get_logger().warn("Joystick Disabled, Pacmod disabled")
 
         elif joy_enable != 0 and self.pacmod_enable:
             # exceuate controller
@@ -395,7 +434,10 @@ class PurePursuit(Node):
                 self.accel_pub.publish(self.accel_cmd)
 
                 # 2. Smoothly ramp brake from 0.0 to 0.5 max over ramp_duration (2.0s)
-                brake_target = min(self.max_stop_brake, self.max_stop_brake * (elapsed / self.ramp_duration))
+                brake_target = min(
+                    self.max_stop_brake,
+                    self.max_stop_brake * (elapsed / self.ramp_duration),
+                )
                 self.brake_cmd.command = brake_target
                 self.brake_pub.publish(self.brake_cmd)
 
@@ -406,11 +448,17 @@ class PurePursuit(Node):
                 # 4. Gear shifting logic: Keep FORWARD (3) while moving, shift to NEUTRAL (2) once stationary
                 if self.speed < 0.05:  # Vehicle is fully stopped
                     self.gear_cmd.command = 2  # NEUTRAL
-                    self.get_logger().info("Vehicle completely stopped. Gear shifted to NEUTRAL.", throttle_duration_sec=2.0)
+                    self.get_logger().info(
+                        "Vehicle completely stopped. Gear shifted to NEUTRAL.",
+                        throttle_duration_sec=2.0,
+                    )
                     self.is_stopping = False
                 else:
                     self.gear_cmd.command = 3  # Keep FORWARD until stopped
-                    self.get_logger().info(f"Decelerating... Speed: {self.speed:.2f} m/s, Brake: {brake_target:.2f}", throttle_duration_sec=0.5)
+                    self.get_logger().info(
+                        f"Decelerating... Speed: {self.speed:.2f} m/s, Brake: {brake_target:.2f}",
+                        throttle_duration_sec=0.5,
+                    )
 
                 self.gear_pub.publish(self.gear_cmd)
 
@@ -418,18 +466,22 @@ class PurePursuit(Node):
                 self.global_cmd.enable = True
                 self.global_pub.publish(self.global_cmd)
 
-                return            
+                return
 
             # Shifting gear to drive if not already in drive
             if self.current_gear != 3:  # FORWARD
                 # Only shift if current brake is above 50%
-                self.get_logger().info(f"Attempting to shift to FORWARD. Current brake: {self.current_brake:.2f}. Press brake above 50% to proceed.")
+                self.get_logger().info(
+                    f"Attempting to shift to FORWARD. Current brake: {self.current_brake:.2f}. Press brake above 50% to proceed."
+                )
                 if self.current_brake > 0.50:
                     self.gear_cmd.command = 3  # FORWARD
                     self.gear_pub.publish(self.gear_cmd)
-            
+
             for i in range(self.wp_size):
-                self.dist_arr[i] = self.dist((self.path_points_x[i], self.path_points_y[i]), (curr_x, curr_y))
+                self.dist_arr[i] = self.dist(
+                    (self.path_points_x[i], self.path_points_y[i]), (curr_x, curr_y)
+                )
 
             self.goal = np.argmin(self.dist_arr)
             ld = self.look_ahead + max(0.0, self.speed - 2.5) * 2
@@ -458,7 +510,6 @@ class PurePursuit(Node):
             pid_throttle_cmd = self.pid_speed.get_control(now, speed_error)
             pid_throttle_cmd = max(0.0, min(pid_throttle_cmd, self.max_accel))
 
-
             ## E2-specific kick-start logic
             # Kick-start: once in FORWARD gear but still near a dead stop,
             # hold EXACTLY kick_start_accel continuously (across many ticks,
@@ -469,13 +520,18 @@ class PurePursuit(Node):
             # friction while a sustained 0.5 does not, so this must not be
             # "at least kick_start_accel" (max() with the PID output), it
             # must be the specific calibrated value.
-            if self.vehicle_name == "e2" and self.current_gear == 3 and self.speed < self.kick_start_speed_threshold:
+            if (
+                self.vehicle_name == "e2"
+                and self.current_gear == 3
+                and self.speed < self.kick_start_speed_threshold
+            ):
                 if not self.kick_start_active:
                     self.kick_start_active = True
                     self.kick_start_end_time = now + self.kick_start_duration
                     self.get_logger().info(
                         f"Kick-start: holding accel={self.kick_start_accel:.2f} for up to "
-                        f"{self.kick_start_duration:.1f}s to break static friction")
+                        f"{self.kick_start_duration:.1f}s to break static friction"
+                    )
                 if now < self.kick_start_end_time:
                     self.get_logger().info(f"Waiting for kick-start to complete")
                     throttle_cmd = self.kick_start_accel
@@ -500,13 +556,15 @@ class PurePursuit(Node):
             self.global_cmd.enable = True
             self.global_pub.publish(self.global_cmd)
 
-            self.get_logger().info(f"Current pose: ({curr_x:.2f}, {curr_y:.2f}, {curr_yaw:.2f}), Target: ({target_x:.2f}, {target_y:.2f}), Speed: {self.speed:.2f}, Throttle: {throttle_cmd:.2f}, Steering: {steering_wheel_angle:.2f}")
+            self.get_logger().info(
+                f"Current pose: ({curr_x:.2f}, {curr_y:.2f}, {curr_yaw:.2f}), Target: ({target_x:.2f}, {target_y:.2f}), Speed: {self.speed:.2f}, Throttle: {throttle_cmd:.2f}, Steering: {steering_wheel_angle:.2f}"
+            )
 
     def destroy_node(self):
         # Cancel and destroy the timer to stop the control loop before shutting down
         self.timer.cancel()
         self.destroy_timer(self.timer)
-        
+
         self.get_logger().info("Publishing final disable command...")
         self.global_cmd.enable = False
 
@@ -515,9 +573,10 @@ class PurePursuit(Node):
             self.global_pub.publish(self.global_cmd)
             # Give the network stack a tiny window to flush the queue out
             rclpy.spin_once(self, timeout_sec=0.05)
-            
+
         self.get_logger().info("Destroying PurePursuit node")
         super().destroy_node()
+
 
 def main(args=None):
     # Disable rclpy's built-in SIGINT handler (default: SignalHandlerOptions.ALL).
@@ -541,5 +600,5 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
