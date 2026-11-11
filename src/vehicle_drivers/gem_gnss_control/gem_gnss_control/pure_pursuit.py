@@ -602,3 +602,27 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+
+# TODO Potential Issues:
+# Derivative Noise Amplification
+
+
+# # Terminal 1: bring up Pacmod and Robot State Publisher
+# ros2 launch basic_launch dbw_only.launch.py
+
+# # Terminal 2: bring up GNSS/INS only
+# ros2 launch basic_launch gnss.launch.py
+
+# # Terminal 3: start path tracking controller
+# ros2 launch gem_gnss_control pure_pursuit.launch.py
+
+# ros2 topic list
+# /ackermann_cmd = specifying control inputs like steering angle, steering rate, speed, and acceleration.
+# /camera/camera_info
+# /camera/image_raw
+# /camera/image_raw/compressed
+# /camera/image_raw/compressedDepth
+# /camera/image_raw/theora
+# /camera/image_raw/zstd
+# /clock
+# /scan/points

@@ -139,3 +139,16 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+
+
+# TODO
+# # Terminal 1: bring up Pacmod and Robot State Publisher
+# ros2 launch basic_launch dbw_only.launch.py
+
+# # Terminal 2: bring up GNSS/INS only
+# ros2 launch basic_launch gnss.launch.py
+
+# # Terminal 3: start recording while you drive manually
+# ros2 launch gem_gnss_control record_waypoints.launch.py output_file:=my_track.csv min_distance:=0.5
+
+# make sure to save and export the saved waypoints to a csv file in the same format as pure_pursuit.py expects.
