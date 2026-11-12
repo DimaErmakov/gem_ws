@@ -10,18 +10,12 @@
 import os
 import csv
 import math
-from tkinter import Image
 import numpy as np
 from numpy import linalg as la
-import rich
 import scipy.signal as signal
 import pymap3d as pm
 import pygame
-import argparse
-import torch
-import cv2
-from simple_enet import SimpleENet
-from cv_bridge import CvBridge
+
 import rclpy
 from rclpy.node import Node
 
@@ -36,10 +30,17 @@ from pacmod2_msgs.msg import (
     SystemRptFloat,
     SystemRptInt,
 )
+
+# NEW IMPORTS
 from sensor_msgs.msg import CameraInfo, Image, NavSatFix, PointCloud2
 from septentrio_gnss_driver.msg import INSNavGeod
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PointStamped
+from simple_enet import SimpleENet
+from cv_bridge import CvBridge
+import argparse
+import torch
+import cv2
 
 # Initialize pygame for joystick
 pygame.init()
@@ -104,16 +105,21 @@ class PurePursuit(Node):
     def __init__(self, args):
         super().__init__("pure_pursuit_node")
         # Declare parameters with default values
-        self.declare_parameter("vehicle_name", "e2")
+
+        self.declare_parameter("vehicle_name", args.car_type)
+
+        if args.car_type == "e2":
+            self.declare_parameter("wheelbase", 1.75)
+        elif args.car_type == "e4":
+            self.declare_parameter("wheelbase", 2.57)
         self.declare_parameter("rate_hz", 20)
         self.declare_parameter("look_ahead", 5.0)
-        self.declare_parameter("wheelbase", 2.57)
         self.declare_parameter("offset", 1.26)
         self.declare_parameter("origin_lat", 40.0927422)
         self.declare_parameter("origin_lon", -88.2359639)
         self.declare_parameter("desired_speed", 2.6)
         self.declare_parameter("max_accel", 0.5)
-        self.declare_parameter("waypoints_file", "track.csv")
+        self.declare_parameter("waypoints_file", args.track_waypoint_path)
         self.declare_parameter("stop_distance", 2.0)
 
         ## E2-specific kick-start parameters
@@ -125,7 +131,9 @@ class PurePursuit(Node):
         # the normal PID-computed accel works fine.
         self.declare_parameter("kick_start_accel", 0.3)
         self.declare_parameter("kick_start_duration", 1.0)
-        self.declare_parameter("kick_start_speed_threshold", 0.15)
+        self.declare_parameter(
+            "kick_start_speed_threshold", 0.15
+        )  # 0.1 in config? TODO
 
         self.declare_parameter("pid/kp", 0.6)
         self.declare_parameter("pid/ki", 0.0)
@@ -143,7 +151,6 @@ class PurePursuit(Node):
             )
         else:
             self.get_logger().info(f"Using vehicle config: {vehicle_name}")
-
         self.vehicle_name = self.get_parameter("vehicle_name").value
         self.rate_hz = self.get_parameter("rate_hz").value
         self.look_ahead = self.get_parameter("look_ahead").value
@@ -179,10 +186,12 @@ class PurePursuit(Node):
         self.goal = 0
         if args.run_model:
             try:
-                self.lane_detection_model = load_model(args.lane_detection_model_path)
+                self.lane_detection_model = self.load_model(
+                    args.lane_detection_model_path
+                )
                 if self.lane_detection_model is not None:
                     self.lane_detection_model = self.lane_detection_model.to(self._dev)
-                    rich.print("[green]loaded SimpleEnet :o[/green]")
+                    self.get_logger().info("[green]loaded SimpleEnet :o[/green]")
             except Exception as e:
                 self.get_logger().error(f"could not load SimpleEnet model x_X: {e}")
                 self.lane_detection_model = None
@@ -342,11 +351,11 @@ class PurePursuit(Node):
         if self.lane_detection_model is not None:
             image = self._cv_bridge.imgmsg_to_cv2(self._image_msg, "bgr8")
 
-            mask = inference(self.lane_detection_model, image, self._dev)
+            mask = self.inference(self.lane_detection_model, image, self._dev)
 
-            m = mask.astype(np.uint8) * 255
-
-            mask_msg = self._cv_bridge.cv2_to_imgmsg(m, "mono8")
+            # m = mask.astype(np.uint8) * 255
+            # mask_msg = self._cv_bridge.cv2_to_imgmsg(m, "mono8")
+            mask_msg = self._cv_bridge.cv2_to_imgmsg(mask, "np.uint8")
 
             self.lane_mask_pub.publish(mask_msg)
 
@@ -741,17 +750,25 @@ def main():
         "--car_width", type=float, default=1, help="Standard car width in meters"
     )
     parser.add_argument(
-        "--car_length", type=float, default=1.75, help="Standard car length in meters"
+        "--car_length",
+        type=float,
+        default=1.75,
+        help="Standard car length, NOT wheelbase, in meters",
     )
     parser.add_argument(
         "--lane_detection_model_path",
-        default="lane_detection_model.pth",  # TODO check
+        default="blob_with_color.pth",  # TODO check
         help="Path to the lane detection model",
     )
     parser.add_argument(
         "--stop_sign_model_path",
         default="stop_sign_model.pth",  # TODO check
         help="Path to the stop sign detection model",
+    )
+    parser.add_argument(
+        "--track_waypoint_path",
+        default="e4_track.csv",  # TODO check
+        help="Path to the track waypoint model",
     )
     parser.add_argument("--run_model", action="store_true", help="Run inference")
     parser.add_argument(
@@ -764,11 +781,14 @@ def main():
         default="/depth_image_output",
         help="Publishing topic of depth output",
     )
+    parser.add_argument(
+        "--car_type",
+        default="e2",
+        help="Type of the car",
+    )
 
-    # 1. Parse known args so ROS remappings don't conflict with argparse
     args, unknown = parser.parse_known_args()
 
-    # 2. Initialize rclpy (pass sys.argv or leave empty, NOT the argparse namespace)
     rclpy.init(signal_handler_options=rclpy.SignalHandlerOptions.NO)
 
     # 3. Pass the parsed args into your node constructor
@@ -792,13 +812,19 @@ if __name__ == "__main__":
 
 
 # # Terminal 1: bring up Pacmod and Robot State Publisher
+# cd ~/gem_ws/gem_or_death
+# colcon build --symlink-install
 # ros2 launch basic_launch dbw_only.launch.py
 
 # # Terminal 2: bring up GNSS/INS only
+# cd ~/gem_ws/gem_or_death
+# colcon build --symlink-install
 # ros2 launch basic_launch gnss.launch.py
 
 # # Terminal 3: start path tracking controller
-# ros2 launch gem_gnss_control pure_pursuit.launch.py
+# cd ~/gem_ws/gem_or_death
+# colcon build --symlink-install
+# ros2 launch gem_gnss_control new_pure_pursuit.launch.py
 
 # ros2 topic list
 # /ackermann_cmd = specifying control inputs like steering angle, steering rate, speed, and acceleration.
