@@ -1,0 +1,859 @@
+#!/usr/bin/env python3
+
+# ================================================================
+# File name: pure_pursuit_ros2.py
+# Description: GNSS waypoints tracker using PID and pure pursuit in ROS2
+# Author: Zillur Rahman, Jiaming Zhang, Hang Cui
+# Date: 2026-09-03
+# ================================================================
+
+import os
+import csv
+import math
+import numpy as np
+from numpy import linalg as la
+import scipy.signal as signal
+import pymap3d as pm
+import pygame
+
+import rclpy
+from rclpy.node import Node
+
+from std_msgs.msg import Bool, Float32
+from pacmod2_msgs.msg import (
+    PositionWithSpeed,
+    VehicleSpeedRpt,
+    GlobalCmd,
+    SystemCmdFloat,
+    SystemCmdInt,
+    GlobalRpt,
+    SystemRptFloat,
+    SystemRptInt,
+)
+
+# NEW IMPORTS
+from sensor_msgs.msg import CameraInfo, Image, NavSatFix, PointCloud2
+from septentrio_gnss_driver.msg import INSNavGeod
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PointStamped
+from simple_enet import SimpleENet
+from cv_bridge import CvBridge
+import argparse
+import torch
+import cv2
+
+# Initialize pygame for joystick
+pygame.init()
+pygame.joystick.init()
+if pygame.joystick.get_count() == 0:
+    raise RuntimeError("No joystick connected")
+joystick = pygame.joystick.Joystick(0)
+joystick.init()
+
+
+class PID:
+    def __init__(self, kp, ki, kd, wg=None):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.wg = wg
+        self.iterm = 0
+        self.last_e = 0
+        self.last_t = None
+
+    def reset(self):
+        self.iterm = 0
+        self.last_e = 0
+        self.last_t = None
+
+    def get_control(self, t, e):
+        if self.last_t is None:
+            dt = 0.0
+            de = 0.0
+        else:
+            dt = t - self.last_t
+            de = (e - self.last_e) / dt if dt > 0.0 else 0.0
+
+        self.iterm += e * dt
+        if self.wg is not None:
+            self.iterm = max(min(self.iterm, self.wg), -self.wg)
+
+        self.last_e = e
+        self.last_t = t
+
+        return self.kp * e + self.ki * self.iterm + self.kd * de
+
+
+class OnlineFilter:
+    def __init__(self, cutoff, fs, order):
+        nyq = 0.5 * fs
+        normal_cutoff = cutoff / nyq
+        self.b, self.a = signal.butter(order, normal_cutoff, btype="low", analog=False)
+        self.z = signal.lfilter_zi(self.b, self.a)
+
+    def get_data(self, data):
+        filted, self.z = signal.lfilter(self.b, self.a, [data], zi=self.z)
+        return filted[0]
+
+
+def quaternion_from_yaw(yaw):
+    return (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+
+
+class PurePursuit(Node):
+
+    def __init__(self, args):
+        super().__init__("pure_pursuit_node")
+        # Declare parameters with default values
+
+        self.declare_parameter("vehicle_name", args.car_type)
+
+        if args.car_type == "e2":
+            self.declare_parameter("wheelbase", 1.75)
+        elif args.car_type == "e4":
+            self.declare_parameter("wheelbase", 2.57)
+        self.declare_parameter("offset", 1.26)
+        self.declare_parameter("rate_hz", 20)
+        self.declare_parameter("look_ahead", 5.0)
+        self.declare_parameter("origin_lat", 40.0927422)
+        self.declare_parameter("origin_lon", -88.2359639)
+        self.declare_parameter("desired_speed", 2.6)
+        self.declare_parameter("max_accel", 0.5)
+        self.declare_parameter("waypoints_file", args.track_waypoint_path)
+        self.declare_parameter("stop_distance", 2.0)
+        self.declare_parameter("dry_run", True)
+
+        ## E2-specific kick-start parameters
+        # Static-friction "kick-start": a single high accel command isn't held
+        # long enough (one 50ms tick before the next control_loop call
+        # recomputes it) for the actuator/motor controller to actually
+        # overcome stiction from a dead stop. Empirically (E2 testing),
+        # holding ~0.3 continuously for ~1s is what's needed; once rolling,
+        # the normal PID-computed accel works fine.
+        self.declare_parameter("kick_start_accel", 0.3)
+        self.declare_parameter("kick_start_duration", 1.0)
+        self.declare_parameter(
+            "kick_start_speed_threshold", 0.15
+        )  # 0.1 in config? TODO
+
+        self.declare_parameter("pid/kp", 0.6)
+        self.declare_parameter("pid/ki", 0.0)
+        self.declare_parameter("pid/kd", 0.1)
+        self.declare_parameter("pid/wg", 10)
+
+        self.declare_parameter("filter/cutoff", 1.2)
+        self.declare_parameter("filter/fs", 30)
+        self.declare_parameter("filter/order", 4)
+
+        vehicle_name = self.get_parameter("vehicle_name").value
+        if vehicle_name == "":
+            self.get_logger().warn(
+                "No vehicle_name parameter found. No config file loaded, defaulting to 'e4' parameters."
+            )
+        else:
+            self.get_logger().info(f"Using vehicle config: {vehicle_name}")
+        self.dry_run = self.get_parameter("dry_run").value
+        if self.dry_run:
+            self.get_logger().warn("DRY RUN: no commands will be sent to PACMod")
+        self.vehicle_name = self.get_parameter("vehicle_name").value
+        self.rate_hz = self.get_parameter("rate_hz").value
+        self.look_ahead = self.get_parameter("look_ahead").value
+        self.wheelbase = self.get_parameter("wheelbase").value
+        self.offset = self.get_parameter("offset").value
+        self.olat = self.get_parameter("origin_lat").value
+        self.olon = self.get_parameter("origin_lon").value
+        self.stop_dist_threshold = self.get_parameter("stop_distance").value
+        self.kick_start_accel = self.get_parameter("kick_start_accel").value
+        self.kick_start_duration = self.get_parameter("kick_start_duration").value
+        self.kick_start_speed_threshold = self.get_parameter(
+            "kick_start_speed_threshold"
+        ).value
+
+        self.desired_speed = min(
+            5.0, self.get_parameter("desired_speed").value
+        )  # desired speed capped at 5 m/s
+        self.max_accel = min(
+            2.0, self.get_parameter("max_accel").value
+        )  # max acceleration capped at 2 m/s^2
+        self.pid_speed = PID(
+            kp=self.get_parameter("pid/kp").value,
+            ki=self.get_parameter("pid/ki").value,
+            kd=self.get_parameter("pid/kd").value,
+            wg=self.get_parameter("pid/wg").value,
+        )
+        self.speed_filter = OnlineFilter(
+            cutoff=self.get_parameter("filter/cutoff").value,
+            fs=self.get_parameter("filter/fs").value,
+            order=self.get_parameter("filter/order").value,
+        )
+
+        self.goal = 0
+        if args.run_model:
+            try:
+                self.lane_detection_model = self.load_model(
+                    args.lane_detection_model_path
+                )
+                if self.lane_detection_model is not None:
+                    self.lane_detection_model = self.lane_detection_model.to(self._dev)
+                    self.get_logger().info("[green]loaded SimpleEnet :o[/green]")
+            except Exception as e:
+                self.get_logger().error(f"could not load SimpleEnet model x_X: {e}")
+                self.lane_detection_model = None
+        else:
+            self.lane_detection_model = None
+
+        # Subscriptions
+        self.create_subscription(NavSatFix, "/navsatfix", self.gnss_callback, 10)
+        self.create_subscription(INSNavGeod, "/insnavgeod", self.ins_callback, 10)
+        self.create_subscription(Bool, "/pacmod/enabled", self.enable_callback, 10)
+        self.create_subscription(
+            VehicleSpeedRpt, "/pacmod/vehicle_speed_rpt", self.speed_callback, 10
+        )
+        self.create_subscription(
+            SystemRptFloat, "/pacmod/brake_rpt", self.brake_rpt_callback, 10
+        )
+        self.current_brake = 0.0
+        self.create_subscription(
+            SystemRptInt, "/pacmod/shift_rpt", self.shift_rpt_callback, 10
+        )
+        self.current_gear = 2
+
+        self.create_subscription(
+            Float32, "/joystick/brake_value", self.brake_callback, 10
+        )
+        self.pacmod_override_active = False
+        self.create_subscription(
+            GlobalRpt, "/pacmod/global_rpt", self.global_rpt_callback, 10
+        )
+        # Sensor Subscriptions based on parsed arguments
+        self.create_subscription(Image, args.camera_topic, self._on_camera_image, 10)
+        self.create_subscription(
+            Image, args.depth_camera_topic, self._on_depth_image, 10
+        )
+        self.create_subscription(
+            PointCloud2, args.lidar_topic, self._on_lidar_points, 10
+        )
+        camera_info_topic = getattr(args, "camera_info_topic", "/camera/camera_info")
+        self.create_subscription(
+            CameraInfo, camera_info_topic, self._on_camera_info, 10
+        )
+
+        # Publishers
+        self.global_pub = self.create_publisher(GlobalCmd, "/pacmod/global_cmd", 10)
+        self.gear_pub = self.create_publisher(SystemCmdInt, "/pacmod/shift_cmd", 10)
+        self.brake_pub = self.create_publisher(SystemCmdFloat, "/pacmod/brake_cmd", 10)
+        self.accel_pub = self.create_publisher(SystemCmdFloat, "/pacmod/accel_cmd", 10)
+        self.turn_pub = self.create_publisher(SystemCmdInt, "/pacmod/turn_cmd", 10)
+        self.steer_pub = self.create_publisher(
+            PositionWithSpeed, "/pacmod/steering_cmd", 10
+        )
+        self.lane_mask_pub = self.create_publisher(Image, args.lane_mask_topic, 10)
+        self.depth_pub = self.create_publisher(Image, args.depth_output_topic, 10)
+
+        self.local_odom_pub = self.create_publisher(Odometry, "/gem/local_odom", 10)
+        self.target_point_pub = self.create_publisher(
+            PointStamped, "/pure_pursuit/target_point", 10
+        )
+
+        # Commands
+        self.global_cmd = GlobalCmd(
+            enable=False, clear_override=True, ignore_override=False
+        )
+        self.gear_cmd = SystemCmdInt(command=2)  # NEUTRAL
+        self.brake_cmd = SystemCmdFloat(command=0.0)
+        self.accel_cmd = SystemCmdFloat(command=0.0)
+        self.turn_cmd = SystemCmdInt(command=1)  # no signal
+        self.steer_cmd = PositionWithSpeed(
+            angular_position=0.0, angular_velocity_limit=4.0
+        )
+
+        self.read_waypoints()
+
+        # Initialize
+        self.lat = 0.0
+        self.lon = 0.0
+        self.heading = 0.0
+        self.speed = 0.0
+        self.gem_enable = False
+        self.pacmod_enable = False
+        self.brake_value = 0.0
+        self.is_stopping = False
+        self.stop_start_time = 0.0
+        self.ramp_duration = 1.5
+        self.max_stop_brake = 0.7
+        self.kick_start_active = False
+        self.kick_start_end_time = 0.0
+        self._dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._cv_bridge = CvBridge()
+        self.dist_arr = np.zeros(len(self.path_points_lon_x))
+
+        self.timer = self.create_timer(1.0 / self.rate_hz, self.control_loop)
+
+    def _send(self, publisher, msg):
+        # DRY RUN: every PACMod command goes through here. Nothing is sent while dry_run is true.
+        if self.dry_run:
+            return
+        publisher.publish(msg)
+
+    def gnss_callback(self, msg):
+        self.lat = msg.latitude
+        self.lon = msg.longitude
+
+    def ins_callback(self, msg):
+        self.heading = msg.heading
+
+    def speed_callback(self, msg):
+        self.speed = self.speed_filter.get_data(msg.vehicle_speed)
+
+    def enable_callback(self, msg):
+        self.pacmod_enable = msg.data
+
+    def global_rpt_callback(self, msg):
+        self.pacmod_override_active = msg.override_active
+
+        if self.pacmod_override_active:
+            # Operator physically grabbed the steering wheel/brake/accelerator.
+            self.global_cmd.enable = False
+            self.get_logger().warn(
+                "Manual override detected on PACMod - disengaging autonomous control",
+                throttle_duration_sec=1.0,
+            )
+            self.gear_cmd.command = 2  # NEUTRAL
+            self.gear_pub.publish(self.gear_cmd)
+
+            self.global_pub.publish(self.global_cmd)
+
+    def brake_callback(self, msg):
+        self.brake_value = msg.data
+
+    def brake_rpt_callback(self, msg):
+        self.current_brake = msg.output
+
+    def shift_rpt_callback(self, msg):
+        self.current_gear = msg.output
+
+    def _on_camera_info(self, msg):
+        """Callback for camera_info to extract and print the intrinsic matrix K."""
+        # msg.K is a flat list/array of 9 elements: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+        intrinsic_matrix = np.array(msg.K).reshape(3, 3)
+
+        self.get_logger().info(
+            f"Camera Intrinsic Matrix (K):\n"
+            f"[{intrinsic_matrix[0,0]:.2f}, {intrinsic_matrix[0,1]:.2f}, {intrinsic_matrix[0,2]:.2f}]\n"
+            f"[{intrinsic_matrix[1,0]:.2f}, {intrinsic_matrix[1,1]:.2f}, {intrinsic_matrix[1,2]:.2f}]\n"
+            f"[{intrinsic_matrix[2,0]:.2f}, {intrinsic_matrix[2,1]:.2f}, {intrinsic_matrix[2,2]:.2f}]",
+            throttle_duration_sec=5.0,
+        )
+        print(
+            f"Camera Intrinsic Matrix (K):\n"
+            f"[{intrinsic_matrix[0,0]:.2f}, {intrinsic_matrix[0,1]:.2f}, {intrinsic_matrix[0,2]:.2f}]\n"
+            f"[{intrinsic_matrix[1,0]:.2f}, {intrinsic_matrix[1,1]:.2f}, {intrinsic_matrix[1,2]:.2f}]\n"
+            f"[{intrinsic_matrix[2,0]:.2f}, {intrinsic_matrix[2,1]:.2f}, {intrinsic_matrix[2,2]:.2f}]"
+        )
+
+    def _on_camera_image(self, msg):
+        """Callback for standard RGB camera frames."""
+        self.get_logger().info(
+            f"Received RGB image | Width: {msg.width}, Height: {msg.height}",
+            throttle_duration_sec=2.0,
+        )
+        self._image_msg = msg
+        if self.lane_detection_model is not None:
+            image = self._cv_bridge.imgmsg_to_cv2(self._image_msg, "bgr8")
+
+            mask = self.inference(self.lane_detection_model, image, self._dev)
+
+            # m = mask.astype(np.uint8) * 255
+
+            # mask_msg = self._cv_bridge.cv2_to_imgmsg(m, "mono8")
+            mask_msg = self._cv_bridge.cv2_to_imgmsg(mask, "mono8")
+
+            self.lane_mask_pub.publish(mask_msg)
+
+    def _on_depth_image(self, msg):
+        """Callback for depth camera frames."""
+        self.get_logger().info(
+            f"Received depth image | Encoding: {msg.encoding}",
+            throttle_duration_sec=2.0,
+        )
+        self._depth_msg = msg
+        depth_image = self._cv_bridge.imgmsg_to_cv2(
+            self._depth_msg, desired_encoding="passthrough"
+        )
+        self.depth_pub.publish(
+            self._cv_bridge.cv2_to_imgmsg(depth_image, encoding="32FC1")
+        )
+
+    def _on_lidar_points(self, msg):
+        """Callback for 3D LiDAR point cloud data (/scan/points)."""
+        self.get_logger().info(
+            f"Received PointCloud2 | Frame ID: {msg.header.frame_id}, Points: {len(msg.data)} bytes",
+            throttle_duration_sec=2.0,
+        )
+        self._lidar_msg = msg
+
+    def read_waypoints(self):
+        waypoints_file = self.get_parameter("waypoints_file").value
+        if os.path.isabs(waypoints_file):
+            filename = waypoints_file
+        else:
+            # os.path.realpath() resolves through the symlink that
+            # `colcon build --symlink-install` creates for this module file,
+            # so this ends up pointing at waypoints/ in the source checkout
+            # (src/.../gem_gnss_control/waypoints) instead of a copy inside
+            # build/ or install/.
+            dirname = os.path.dirname(os.path.realpath(__file__))
+            filename = os.path.join(dirname, "../waypoints", waypoints_file)
+        self.get_logger().info(f"Loading waypoints from: {filename}")
+        with open(filename) as f:
+            path_points = [tuple(line) for line in csv.reader(f)]
+        self.path_points_lon_x = [float(p[0]) for p in path_points]
+        self.path_points_lat_y = [float(p[1]) for p in path_points]
+        self.path_points_heading = [float(p[2]) for p in path_points]
+        self.wp_size = len(self.path_points_lon_x)
+
+    def heading_to_yaw(self, heading):
+        return np.radians(90 - heading) if heading < 270 else np.radians(450 - heading)
+
+    def wps_to_local_xy(self, lon, lat):
+        x, y, _ = pm.geodetic2enu(lat, lon, 0, self.olat, self.olon, 0)
+        return x, y
+
+    def dist(self, p1, p2):
+        return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
+    def front2steer(self, f_angle):
+        f_angle = max(min(f_angle, 35), -35)
+        angle = abs(f_angle)
+        steer_angle = -0.1084 * angle**2 + 21.775 * angle
+        return round(steer_angle if f_angle >= 0 else -steer_angle, 2)
+
+    def check_joystick_enable(self):
+        pygame.event.pump()
+        try:
+            lb = joystick.get_button(6)
+            rb = joystick.get_button(7)
+        except pygame.error:
+            self.get_logger().warn("Joystick read failed")
+            return 2
+        if lb and rb:
+            # enable
+            self.get_logger().warn("Joystick Pressed")
+            return 1
+        elif lb and not rb:
+            # disable
+            self.get_logger().warn("Joystick Released")
+            return 0
+        # others
+        return 2
+
+    def get_gem_state(self):
+        local_x, local_y = self.wps_to_local_xy(self.lon, self.lat)
+        yaw = self.heading_to_yaw(self.heading)
+        x = local_x - self.offset * math.cos(yaw)
+        y = local_y - self.offset * math.sin(yaw)
+        return x, y, yaw
+
+    def publish_local_odom(self, x, y, yaw):
+        odom = Odometry()
+        odom.header.stamp = self.get_clock().now().to_msg()
+        odom.header.frame_id = "map"
+        odom.child_frame_id = "base_link"
+        odom.pose.pose.position.x = x
+        odom.pose.pose.position.y = y
+        qx, qy, qz, qw = quaternion_from_yaw(yaw)
+        odom.pose.pose.orientation.x = qx
+        odom.pose.pose.orientation.y = qy
+        odom.pose.pose.orientation.z = qz
+        odom.pose.pose.orientation.w = qw
+        odom.twist.twist.linear.x = self.speed
+        self.local_odom_pub.publish(odom)
+
+    def publish_target_point(self, x, y):
+        pt = PointStamped()
+        pt.header.stamp = self.get_clock().now().to_msg()
+        pt.header.frame_id = "map"
+        pt.point.x = x
+        pt.point.y = y
+        self.target_point_pub.publish(pt)
+
+    def control_loop(self):
+        joy_enable = self.check_joystick_enable()
+
+        curr_x, curr_y, curr_yaw = self.get_gem_state()
+        self.publish_local_odom(curr_x, curr_y, curr_yaw)
+        # DRY RUN: skip the enable/disable logic and run the tracking math on
+        # every tick, so the target point, steering, and throttle can be
+        # inspected while the vehicle stays disabled. _send() blocks all PACMod commands.
+        if self.dry_run:
+            self.drive(curr_x, curr_y, curr_yaw)
+            return
+
+        if joy_enable == 1 and not self.pacmod_enable:
+            # joystick enable when vehicle disbaled
+            self.global_cmd.enable = True
+            self.global_cmd.clear_override = True
+            self.global_pub.publish(self.global_cmd)
+
+            self.brake_cmd.command = 0.0
+            self.brake_pub.publish(self.brake_cmd)
+
+            self.accel_cmd.command = 0.0
+            self.accel_pub.publish(self.accel_cmd)
+
+            self.turn_cmd.command = 3
+            self.turn_pub.publish(self.turn_cmd)
+
+            self.get_logger().warn(
+                "Joystick enabled, Pacmod enabled, forward gear engaged"
+            )
+
+        elif joy_enable == 0 and self.pacmod_enable:
+            # joystick disable when vehicle enbaled
+            self.global_cmd.enable = False
+
+            self.turn_cmd.command = 1
+            self.turn_pub.publish(self.turn_cmd)
+
+            self.gear_cmd.command = 2
+            self.gear_pub.publish(self.gear_cmd)
+
+            self.global_pub.publish(self.global_cmd)
+            self.get_logger().warn("Joystick Disabled, Pacmod disabled")
+
+        elif joy_enable != 0 and self.pacmod_enable:
+            # exceuate controller
+            self.path_points_x = np.array(self.path_points_lon_x)
+            self.path_points_y = np.array(self.path_points_lat_y)
+
+            # Check distance to the FINAL waypoint in the track
+            end_x = self.path_points_x[-1]
+            end_y = self.path_points_y[-1]
+            dist_to_end = self.dist((end_x, end_y), (curr_x, curr_y))
+
+            # Trigger stopping sequence if close to final waypoint or already in stopping sequence
+            if dist_to_end <= self.stop_dist_threshold or self.is_stopping:
+                now_sec = self.get_clock().now().nanoseconds * 1e-9
+
+                # First iteration entering stop state
+                if not self.is_stopping:
+                    self.is_stopping = True
+                    self.stop_start_time = now_sec
+                    self.pid_speed.reset()
+                    self.get_logger().warn(
+                        f"Final waypoint reached ({dist_to_end:.2f}m). Initiating smooth braking sequence..."
+                    )
+
+                # Elapsed time since stopping triggered
+                elapsed = now_sec - self.stop_start_time
+
+                # 1. Zero accelerator command
+                self.accel_cmd.command = 0.0
+                self.accel_pub.publish(self.accel_cmd)
+
+                # 2. Smoothly ramp brake from 0.0 to 0.5 max over ramp_duration (2.0s)
+                brake_target = min(
+                    self.max_stop_brake,
+                    self.max_stop_brake * (elapsed / self.ramp_duration),
+                )
+                self.brake_cmd.command = brake_target
+                self.brake_pub.publish(self.brake_cmd)
+
+                # 3. Center steering wheel during stop
+                self.steer_cmd.angular_position = 0.0
+                self.steer_pub.publish(self.steer_cmd)
+
+                # 4. Gear shifting logic: Keep FORWARD (3) while moving, shift to NEUTRAL (2) once stationary
+                if self.speed < 0.05:  # Vehicle is fully stopped
+                    self.gear_cmd.command = 2  # NEUTRAL
+                    self.get_logger().info(
+                        "Vehicle completely stopped. Gear shifted to NEUTRAL.",
+                        throttle_duration_sec=2.0,
+                    )
+                    self.is_stopping = False
+                else:
+                    self.gear_cmd.command = 3  # Keep FORWARD until stopped
+                    self.get_logger().info(
+                        f"Decelerating... Speed: {self.speed:.2f} m/s, Brake: {brake_target:.2f}",
+                        throttle_duration_sec=0.5,
+                    )
+
+                self.gear_pub.publish(self.gear_cmd)
+
+                # Maintain PACMod enable so brake pressure remains active
+                self.global_cmd.enable = True
+                self.global_pub.publish(self.global_cmd)
+
+                return
+
+            # Shifting gear to drive if not already in drive
+            if self.current_gear != 3:  # FORWARD
+                # Only shift if current brake is above 50%
+                self.get_logger().info(
+                    f"Attempting to shift to FORWARD. Current brake: {self.current_brake:.2f}. Press brake above 50% to proceed."
+                )
+                if self.current_brake > 0.50:
+                    self.gear_cmd.command = 3  # FORWARD
+                    self.gear_pub.publish(self.gear_cmd)
+
+            for i in range(self.wp_size):
+                self.dist_arr[i] = self.dist(
+                    (self.path_points_x[i], self.path_points_y[i]), (curr_x, curr_y)
+                )
+
+            self.goal = np.argmin(self.dist_arr)
+            ld = self.look_ahead + max(0.0, self.speed - 2.5) * 2
+            for i in range(self.goal, self.wp_size):
+                if self.dist_arr[i] > ld:
+                    self.goal = i
+                    break
+
+            target_x = self.path_points_x[self.goal]
+            target_y = self.path_points_y[self.goal]
+            target_yaw = self.path_points_heading[self.goal]
+            self.publish_target_point(target_x, target_y)
+            alpha = math.atan2(target_y - curr_y, target_x - curr_x) - curr_yaw
+            curvature = 0.0 if self.speed < 0.2 else 2.0 * math.sin(alpha) / ld
+            steering_angle = math.atan(self.wheelbase * curvature)
+            steering_wheel_angle = self.front2steer(math.degrees(steering_angle))
+
+            self.steer_cmd.angular_position = math.radians(steering_wheel_angle)
+            self.steer_pub.publish(self.steer_cmd)
+
+            # Speed control
+            now = self.get_clock().now().nanoseconds * 1e-9
+            speed_error = self.desired_speed - self.speed
+            if abs(speed_error) < 0.05:
+                speed_error = 0.0
+            pid_throttle_cmd = self.pid_speed.get_control(now, speed_error)
+            pid_throttle_cmd = max(0.0, min(pid_throttle_cmd, self.max_accel))
+
+            ## E2-specific kick-start logic
+            # Kick-start: once in FORWARD gear but still near a dead stop,
+            # hold EXACTLY kick_start_accel continuously (across many ticks,
+            # not just one) for up to kick_start_duration seconds, ignoring
+            # the PID entirely during this window. A larger commanded value
+            # (e.g. the PID's max_accel-clamped output) is NOT a safe
+            # substitute here - testing showed a sustained 0.3 breaks static
+            # friction while a sustained 0.5 does not, so this must not be
+            # "at least kick_start_accel" (max() with the PID output), it
+            # must be the specific calibrated value.
+            if (
+                self.vehicle_name == "e2"
+                and self.current_gear == 3
+                and self.speed < self.kick_start_speed_threshold
+            ):
+                if not self.kick_start_active:
+                    self.kick_start_active = True
+                    self.kick_start_end_time = now + self.kick_start_duration
+                    self.get_logger().info(
+                        f"Kick-start: holding accel={self.kick_start_accel:.2f} for up to "
+                        f"{self.kick_start_duration:.1f}s to break static friction"
+                    )
+                if now < self.kick_start_end_time:
+                    self.get_logger().info(f"Waiting for kick-start to complete")
+                    throttle_cmd = self.kick_start_accel
+                else:
+                    # Timed out without the car moving - stop forcing it and
+                    # fall back to the plain PID output (avoid getting stuck
+                    # commanding kick_start_accel forever if something else
+                    # is actually preventing movement).
+                    self.kick_start_active = False
+                    throttle_cmd = pid_throttle_cmd
+            else:
+                # Already rolling (or not yet in FORWARD) - clear kick-start
+                # state so it can re-arm next time the car comes to a stop.
+                self.kick_start_active = False
+                throttle_cmd = pid_throttle_cmd
+
+            self.accel_cmd.command = throttle_cmd
+            self.brake_cmd.command = max(0.0, min(self.brake_value, 0.8))
+            self._send(self.accel_pub, self.accel_cmd)  # DRY RUN
+            self._send(self.brake_pub, self.brake_cmd)  # DRY RUN
+
+            self.global_cmd.enable = True
+            self._send(self.global_pub, self.global_cmd)  # DRY RUN
+
+            prefix = "[DRY RUN] " if self.dry_run else ""  # DRY RUN
+
+            self.get_logger().info(
+                f"Current pose: ({curr_x:.2f}, {curr_y:.2f}, {curr_yaw:.2f}), Target: ({target_x:.2f}, {target_y:.2f}), Speed: {self.speed:.2f}, Throttle: {throttle_cmd:.2f}, Steering: {steering_wheel_angle:.2f}"
+            )
+
+    def destroy_node(self):
+        # Cancel and destroy the timer to stop the control loop before shutting down
+        self.timer.cancel()
+        self.destroy_timer(self.timer)
+
+        self.get_logger().info("Publishing final disable command...")
+        self.global_cmd.enable = False
+
+        # Publish multiple times to give the DDS discovery/transport layer a chance
+        for _ in range(3):
+            self.global_pub.publish(self.global_cmd)
+            # Give the network stack a tiny window to flush the queue out
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+        self.get_logger().info("Destroying PurePursuit node")
+        super().destroy_node()
+
+    def load_model(self, path_to_your_model: str) -> SimpleENet:
+        model = SimpleENet()
+        model.load_state_dict(torch.load(path_to_your_model, weights_only=True))
+        return model
+
+    def inference(
+        self, model: SimpleENet, image: np.ndarray, device: str
+    ) -> np.ndarray:
+        resized = cv2.resize(image, (640, 384))
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        image = gray.astype(np.float32) / 255.0
+        image = torch.from_numpy(image)
+        image = image.unsqueeze(0)
+        image = image.unsqueeze(0)
+        image = image.to(device)
+        prediction = model(image)
+        prediction = torch.argmax(prediction, dim=1)
+        prediction = prediction.squeeze(0).cpu().numpy()
+        prediction = (prediction * 255).astype(np.float32)
+        prediction = cv2.resize(prediction, (800, 600))
+        return prediction
+
+
+def main():
+    # Disable rclpy's built-in SIGINT handler (default: SignalHandlerOptions.ALL).
+    # That handler shuts down the ROS context the instant Ctrl+C is pressed,
+    # racing against (and usually winning over) our own `except
+    # KeyboardInterrupt` cleanup below - which is exactly why the "disable
+    # PACMod" publish in destroy_node() was failing with "publisher's
+    # context is invalid". With signal handling disabled here, Ctrl+C falls
+    # through to Python's normal KeyboardInterrupt, raised synchronously in
+    # rclpy.spin() below, so the context is still alive when we clean up.
+    parser = argparse.ArgumentParser(
+        description="Pure Pursuit Autonomous Drive with Local Offline Depth Anything V2"
+    )
+    parser.add_argument(
+        "--camera_topic",
+        default="/oak/rgb/image_raw",
+        help="Topic name of camera stream",
+    )
+    parser.add_argument(
+        "--depth_camera_topic",
+        default="/oak/depth/image_raw",  # TODO check
+        help="Topic name of depth camera stream",
+    )
+    parser.add_argument(
+        "--lidar_topic",
+        default="/scan/points",  # TODO check
+        help="Topic name of lidar stream",
+    )
+    parser.add_argument(
+        "--camera_info_topic", default="/camera/camera_info", help="Camera info topic"
+    )
+    parser.add_argument(
+        "--fx", type=float, default=476.70140266418457, help="Camera focal length fx"
+    )
+    parser.add_argument(
+        "--fy", type=float, default=476.7014265060425, help="Camera focal length fy"
+    )
+    parser.add_argument(
+        "--cx", type=float, default=400.0, help="Camera principal point cx"
+    )
+    parser.add_argument(
+        "--cy", type=float, default=300.0, help="Camera principal point cy"
+    )
+    parser.add_argument(
+        "--lane_width", type=float, default=2, help="Standard lane width in meters"
+    )
+    parser.add_argument(
+        "--car_width", type=float, default=1, help="Standard car width in meters"
+    )
+    parser.add_argument(
+        "--car_length",
+        type=float,
+        default=1.75,
+        help="Standard car length, NOT wheelbase, in meters",
+    )
+    parser.add_argument(
+        "--lane_detection_model_path",
+        default="lane_detection_model.pth",  # TODO check
+        help="Path to the lane detection model",
+    )
+    parser.add_argument(
+        "--stop_sign_model_path",
+        default="stop_sign_model.pth",  # TODO check
+        help="Path to the stop sign detection model",
+    )
+    parser.add_argument(
+        "--track_waypoint_path",
+        default="track_waypoint_model.csv",  # TODO check
+        help="Path to the track waypoint model",
+    )
+    parser.add_argument("--run_model", action="store_true", help="Run inference")
+    parser.add_argument(
+        "--lane_mask_topic",
+        default="/lane_detection_mask",
+        help="Publishing topic of lane line mask",
+    )
+    parser.add_argument(
+        "--depth_output_topic",
+        default="/depth_image_output",
+        help="Publishing topic of depth output",
+    )
+    parser.add_argument(
+        "--car_type",
+        default="e2",
+        help="Type of the car",
+    )
+
+    # 1. Parse known args so ROS remappings don't conflict with argparse
+    args, unknown = parser.parse_known_args()
+
+    # 2. Initialize rclpy (pass sys.argv or leave empty, NOT the argparse namespace)
+    rclpy.init(signal_handler_options=rclpy.SignalHandlerOptions.NO)
+
+    # 3. Pass the parsed args into your node constructor
+    pure_pursuit = PurePursuit(args)
+
+    try:
+        rclpy.spin(pure_pursuit)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Call destroy_node before rclpy.shutdown() while context is still alive
+        pure_pursuit.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+
+# TODO Potential Issues:
+# Derivative Noise Amplification
+
+
+# # Terminal 1: bring up Pacmod and Robot State Publisher
+# cd ~/gem_ws/gem_or_death
+# colcon build --symlink-install
+# ros2 launch basic_launch dbw_only.launch.py
+
+# # Terminal 2: bring up GNSS/INS only
+# cd ~/gem_ws/gem_or_death
+# colcon build --symlink-install
+# ros2 launch basic_launch gnss.launch.py
+
+# # Terminal 3: start path tracking controller
+# cd ~/gem_ws/gem_or_death
+# colcon build --symlink-install
+# ros2 launch gem_gnss_control new_pure_pursuit.launch.py dry_run:=false
+
+# ros2 topic list
+# /ackermann_cmd = specifying control inputs like steering angle, steering rate, speed, and acceleration.
+# /camera/camera_info
+# /camera/image_raw
+# /camera/image_raw/compressed
+# /camera/image_raw/compressedDepth
+# /camera/image_raw/theora
+# /camera/image_raw/zstd
+# /clock
+# /scan/points

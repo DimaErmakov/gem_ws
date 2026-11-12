@@ -100,7 +100,7 @@ class PurePursuit(Node):
         self.declare_parameter("vehicle_name", "e2")
         self.declare_parameter("rate_hz", 20)
         self.declare_parameter("look_ahead", 5.0)
-        self.declare_parameter("wheelbase", 2.57)
+        self.declare_parameter("wheelbase", 1.75)
         self.declare_parameter("offset", 1.26)
         self.declare_parameter("origin_lat", 40.0927422)
         self.declare_parameter("origin_lon", -88.2359639)
@@ -605,7 +605,7 @@ if __name__ == "__main__":
 
 # TODO Potential Issues:
 # Derivative Noise Amplification
-
+# change kick_start_speed_threshold to 0.1?
 
 # # Terminal 1: bring up Pacmod and Robot State Publisher
 # ros2 launch basic_launch dbw_only.launch.py

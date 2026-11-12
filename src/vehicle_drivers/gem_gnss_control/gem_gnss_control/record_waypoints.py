@@ -28,7 +28,7 @@ class WaypointRecorder(Node):
 
         # Same origin convention as pure_pursuit.py so recorded waypoints
         # are directly compatible with the pure pursuit local ENU frame.
-        self.declare_parameter("origin_lat", 40.0927422)
+        self.declare_parameter("origin_lat", 40.0927422)  # TODO should be fine to keep
         self.declare_parameter("origin_lon", -88.2359639)
 
         # Where to save the recorded track. Defaults alongside track.csv,
@@ -142,13 +142,20 @@ if __name__ == "__main__":
 
 
 # TODO
+
 # # Terminal 1: bring up Pacmod and Robot State Publisher
+# cd ~/gem_ws/gem_or_death
+# colcon build --symlink-install
 # ros2 launch basic_launch dbw_only.launch.py
 
 # # Terminal 2: bring up GNSS/INS only
+# cd ~/gem_ws/gem_or_death
+# colcon build --symlink-install
 # ros2 launch basic_launch gnss.launch.py
 
 # # Terminal 3: start recording while you drive manually
-# ros2 launch gem_gnss_control record_waypoints.launch.py output_file:=my_track.csv min_distance:=0.5
+# cd ~/gem_ws/gem_or_death
+# colcon build --symlink-install
+# ros2 launch gem_gnss_control record_waypoints.launch.py output_file:=e4_track.csv min_distance:=0.5
 
 # make sure to save and export the saved waypoints to a csv file in the same format as pure_pursuit.py expects.
