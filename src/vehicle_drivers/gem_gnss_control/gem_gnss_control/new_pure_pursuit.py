@@ -102,16 +102,17 @@ def quaternion_from_yaw(yaw):
 
 class PurePursuit(Node):
 
-    def __init__(self, args):
+    def __init__(self):
         super().__init__("pure_pursuit_node")
         # Declare parameters with default values
 
-        self.declare_parameter("vehicle_name", args.car_type)
+        self.declare_parameter("vehicle_name", "e4")
+        vehicle_name = self.get_parameter("vehicle_name").value
 
-        if args.car_type == "e2":
-            self.declare_parameter("wheelbase", 1.75)
-        elif args.car_type == "e4":
-            self.declare_parameter("wheelbase", 2.57)
+        # if vehicle_name == "e4":
+        self.declare_parameter("wheelbase", 2.57)
+        # elif vehicle_name == "e2":
+        #     self.declare_parameter("wheelbase", 1.75)
         self.declare_parameter("rate_hz", 20)
         self.declare_parameter("look_ahead", 5.0)
         self.declare_parameter("offset", 1.26)
@@ -119,7 +120,7 @@ class PurePursuit(Node):
         self.declare_parameter("origin_lon", -88.2359639)
         self.declare_parameter("desired_speed", 2.6)
         self.declare_parameter("max_accel", 0.5)
-        self.declare_parameter("waypoints_file", args.track_waypoint_path)
+        self.declare_parameter("waypoints_file", "e4_track_v2.csv")
         self.declare_parameter("stop_distance", 2.0)
 
         ## E2-specific kick-start parameters
@@ -144,7 +145,6 @@ class PurePursuit(Node):
         self.declare_parameter("filter/fs", 30)
         self.declare_parameter("filter/order", 4)
 
-        vehicle_name = self.get_parameter("vehicle_name").value
         if vehicle_name == "":
             self.get_logger().warn(
                 "No vehicle_name parameter found. No config file loaded, defaulting to 'e4' parameters."
@@ -184,10 +184,45 @@ class PurePursuit(Node):
         )
 
         self.goal = 0
-        if args.run_model:
+        self.declare_parameter("run_lane_model", True)
+        self.sun_lane_model = self.get_parameter("run_lane_model").value
+        self.declare_parameter("lane_width", 3)
+        self.lane_width = self.get_parameter("lane_width").value
+        self.declare_parameter("fx", 476.70140266418457)
+        self.fx = self.get_parameter("fx").value
+        self.declare_parameter("fy", 476.7014265060425)
+        self.fy = self.get_parameter("fy").value
+        self.declare_parameter("cx", 400.0)
+        self.cx = self.get_parameter("cx").value
+        self.declare_parameter("cy", 300.0)
+        self.cy = self.get_parameter("cy").value
+
+        self.declare_parameter("camera_topic", "/camera/image_raw")
+        self.camera_topic = self.get_parameter("camera_topic").value
+        self.declare_parameter("lidar_topic", "/scan/points")
+        self.lidar_topic = self.get_parameter("lidar_topic").value
+        self.declare_parameter("camera_info_topic", "/camera/camera_info")
+        self.camera_info_topic = self.get_parameter("camera_info_topic").value
+
+        self.declare_parameter("depth_output_topic", "/depth_image_output")
+        self.depth_output_topic = self.get_parameter("depth_output_topic").value
+
+        self.declare_parameter(
+            "depth_camera_topic", "/oak/rgb/image_raw/compressedDepth"
+        )
+        self.depth_camera_topic = self.get_parameter("depth_camera_topic").value
+        self.declare_parameter("lane_mask_topic", "/lane_mask_output")
+        self.lane_mask_topic = self.get_parameter("lane_mask_topic").value
+
+        self.declare_parameter("lane_detection_model_path", "blob_with_color.pth")
+        self.lane_detection_model_path = self.get_parameter(
+            "lane_detection_model_path"
+        ).value
+
+        if self.sun_lane_model:
             try:
                 self.lane_detection_model = self.load_model(
-                    args.lane_detection_model_path
+                    self.lane_detection_model_path
                 )
                 if self.lane_detection_model is not None:
                     self.lane_detection_model = self.lane_detection_model.to(self._dev)
@@ -222,16 +257,15 @@ class PurePursuit(Node):
             GlobalRpt, "/pacmod/global_rpt", self.global_rpt_callback, 10
         )
         # Sensor Subscriptions based on parsed arguments
-        self.create_subscription(Image, args.camera_topic, self._on_camera_image, 10)
+        self.create_subscription(Image, self.camera_topic, self._on_camera_image, 10)
         self.create_subscription(
-            Image, args.depth_camera_topic, self._on_depth_image, 10
+            Image, self.depth_camera_topic, self._on_depth_image, 10
         )
         self.create_subscription(
-            PointCloud2, args.lidar_topic, self._on_lidar_points, 10
+            PointCloud2, self.lidar_topic, self._on_lidar_points, 10
         )
-        camera_info_topic = getattr(args, "camera_info_topic", "/camera/camera_info")
         self.create_subscription(
-            CameraInfo, camera_info_topic, self._on_camera_info, 10
+            CameraInfo, self.camera_info_topic, self._on_camera_info, 10
         )
 
         # Publishers
@@ -243,8 +277,8 @@ class PurePursuit(Node):
         self.steer_pub = self.create_publisher(
             PositionWithSpeed, "/pacmod/steering_cmd", 10
         )
-        self.lane_mask_pub = self.create_publisher(Image, args.lane_mask_topic, 10)
-        self.depth_pub = self.create_publisher(Image, args.depth_output_topic, 10)
+        self.lane_mask_pub = self.create_publisher(Image, self.lane_mask_topic, 10)
+        self.depth_pub = self.create_publisher(Image, self.depth_output_topic, 10)
 
         self.local_odom_pub = self.create_publisher(Odometry, "/gem/local_odom", 10)
         self.target_point_pub = self.create_publisher(
@@ -355,7 +389,24 @@ class PurePursuit(Node):
 
             # m = mask.astype(np.uint8) * 255
             # mask_msg = self._cv_bridge.cv2_to_imgmsg(m, "mono8")
-            mask_msg = self._cv_bridge.cv2_to_imgmsg(mask, "np.uint8")
+            ####################
+            class_indices = mask.astype(np.uint8)
+
+            normalized_mask = cv2.normalize(
+                class_indices,
+                None,
+                alpha=0,
+                beta=255,
+                norm_type=cv2.NORM_MINMAX,
+                dtype=cv2.CV_8U,
+            )
+
+            color_mask = cv2.applyColorMap(normalized_mask, cv2.COLORMAP_JET)
+
+            mask_msg = self._cv_bridge.cv2_to_imgmsg(color_mask, encoding="bgr8")
+            #########################
+
+            mask_msg = self._cv_bridge.cv2_to_imgmsg(mask, encoding="bgr8")
 
             self.lane_mask_pub.publish(mask_msg)
 
@@ -506,8 +557,17 @@ class PurePursuit(Node):
 
         elif joy_enable != 0 and self.pacmod_enable:
             # exceuate controller
+            # self.path_points_x = []
+            # self.path_points_y = []
+            # for lon, lat in zip(self.path_points_lon_x, self.path_points_lat_y):
+            #     x, y, _ = pm.geodetic2enu(lat, lon, 0, self.olat, self.olon, 0)
+            #     self.path_points_x.append(x)
+            #     self.path_points_y.append(y)
+            # self.path_points_x = np.array(self.path_points_x)
+            # self.path_points_y = np.array(self.path_points_y)
             self.path_points_x = np.array(self.path_points_lon_x)
             self.path_points_y = np.array(self.path_points_lat_y)
+            print(f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})")
 
             # Check distance to the FINAL waypoint in the track
             end_x = self.path_points_x[-1]
@@ -701,7 +761,7 @@ class PurePursuit(Node):
         return prediction
 
 
-def main():
+def main(args=None):
     # Disable rclpy's built-in SIGINT handler (default: SignalHandlerOptions.ALL).
     # That handler shuts down the ROS context the instant Ctrl+C is pressed,
     # racing against (and usually winning over) our own `except
@@ -710,89 +770,8 @@ def main():
     # context is invalid". With signal handling disabled here, Ctrl+C falls
     # through to Python's normal KeyboardInterrupt, raised synchronously in
     # rclpy.spin() below, so the context is still alive when we clean up.
-    parser = argparse.ArgumentParser(
-        description="Pure Pursuit Autonomous Drive with Local Offline Depth Anything V2"
-    )
-    parser.add_argument(
-        "--camera_topic",
-        default="/oak/rgb/image_raw",
-        help="Topic name of camera stream",
-    )
-    parser.add_argument(
-        "--depth_camera_topic",
-        default="/oak/depth/image_raw",  # TODO check
-        help="Topic name of depth camera stream",
-    )
-    parser.add_argument(
-        "--lidar_topic",
-        default="/scan/points",  # TODO check
-        help="Topic name of lidar stream",
-    )
-    parser.add_argument(
-        "--camera_info_topic", default="/camera/camera_info", help="Camera info topic"
-    )
-    parser.add_argument(
-        "--fx", type=float, default=476.70140266418457, help="Camera focal length fx"
-    )
-    parser.add_argument(
-        "--fy", type=float, default=476.7014265060425, help="Camera focal length fy"
-    )
-    parser.add_argument(
-        "--cx", type=float, default=400.0, help="Camera principal point cx"
-    )
-    parser.add_argument(
-        "--cy", type=float, default=300.0, help="Camera principal point cy"
-    )
-    parser.add_argument(
-        "--lane_width", type=float, default=2, help="Standard lane width in meters"
-    )
-    parser.add_argument(
-        "--car_width", type=float, default=1, help="Standard car width in meters"
-    )
-    parser.add_argument(
-        "--car_length",
-        type=float,
-        default=1.75,
-        help="Standard car length, NOT wheelbase, in meters",
-    )
-    parser.add_argument(
-        "--lane_detection_model_path",
-        default="blob_with_color.pth",  # TODO check
-        help="Path to the lane detection model",
-    )
-    parser.add_argument(
-        "--stop_sign_model_path",
-        default="stop_sign_model.pth",  # TODO check
-        help="Path to the stop sign detection model",
-    )
-    parser.add_argument(
-        "--track_waypoint_path",
-        default="e4_track.csv",  # TODO check
-        help="Path to the track waypoint model",
-    )
-    parser.add_argument("--run_model", action="store_true", help="Run inference")
-    parser.add_argument(
-        "--lane_mask_topic",
-        default="/lane_detection_mask",
-        help="Publishing topic of lane line mask",
-    )
-    parser.add_argument(
-        "--depth_output_topic",
-        default="/depth_image_output",
-        help="Publishing topic of depth output",
-    )
-    parser.add_argument(
-        "--car_type",
-        default="e2",
-        help="Type of the car",
-    )
-
-    args, unknown = parser.parse_known_args()
-
-    rclpy.init(signal_handler_options=rclpy.SignalHandlerOptions.NO)
-
-    # 3. Pass the parsed args into your node constructor
-    pure_pursuit = PurePursuit(args)
+    rclpy.init(args=args, signal_handler_options=rclpy.SignalHandlerOptions.NO)
+    pure_pursuit = PurePursuit()
 
     try:
         rclpy.spin(pure_pursuit)
