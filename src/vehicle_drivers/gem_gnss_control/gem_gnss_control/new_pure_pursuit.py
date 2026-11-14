@@ -41,6 +41,8 @@ from cv_bridge import CvBridge
 import argparse
 import torch
 import cv2
+from sensor_msgs_py import point_cloud2
+
 
 # Initialize pygame for joystick
 pygame.init()
@@ -431,6 +433,7 @@ class PurePursuit(Node):
             throttle_duration_sec=2.0,
         )
         self._lidar_msg = msg
+        self.detect_close_object(200)
 
     def read_waypoints(self):
         waypoints_file = self.get_parameter("waypoints_file").value
@@ -462,6 +465,10 @@ class PurePursuit(Node):
     def dist(self, p1, p2):
         return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
+    # helper function for lidar obstacle detection
+    def dist_3D(self, p1, p2):
+        return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2 + (p1[2] - p2[2])**2)
+    
     def front2steer(self, f_angle):
         f_angle = max(min(f_angle, 35), -35)
         angle = abs(f_angle)
@@ -493,6 +500,15 @@ class PurePursuit(Node):
         x = local_x - self.offset * math.cos(yaw)
         y = local_y - self.offset * math.sin(yaw)
         return x, y, yaw
+
+    # function to detect if the lidar sees something too close to the car
+    def detect_close_object(self, threshold=1.0):
+        points = point_cloud2.read_points_list(self._lidar_msg, field_names=("x", "y", "z"))
+        for point in points:
+            if self.dist_3D(point, (0, 0, 0)) < threshold:
+                print("Close object detected at point:", point)
+                return True
+        return False
 
     def publish_local_odom(self, x, y, yaw):
         odom = Odometry()
