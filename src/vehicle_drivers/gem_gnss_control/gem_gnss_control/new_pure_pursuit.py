@@ -505,9 +505,10 @@ class PurePursuit(Node):
     def detect_close_object(self, threshold=1.0):
         points = point_cloud2.read_points_list(self._lidar_msg, field_names=("x", "y", "z"))
         for point in points:
-            if self.dist_3D(point, (0, 0, 0)) < threshold:
-                print("Close object detected at point:", point)
-                return True
+            if (point[1] > -100 and point[1] < 100 and point[0] > 0): # limit scan to front of car between the lanes
+                if self.dist_3D(point, (0, 0, 0)) < threshold:
+                    print("Close object detected at point:", point)
+                    return True
         return False
 
     def publish_local_odom(self, x, y, yaw):
