@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 
 # ================================================================
-# File name: pure_pursuit_ros2.py
 # Description: GNSS waypoints tracker using PID and pure pursuit in ROS2
-# Author: Zillur Rahman, Jiaming Zhang, Hang Cui
+# Author: Zillur Rahman, Jiaming Zhang, Hang Cui, Dimitry
 # Date: 2026-09-03
 # ================================================================
 
@@ -42,7 +41,6 @@ import argparse
 import torch
 import cv2
 from sensor_msgs_py import point_cloud2
-
 
 # Initialize pygame for joystick
 pygame.init()
@@ -110,7 +108,6 @@ class PurePursuit(Node):
 
         self.declare_parameter("vehicle_name", "e4")
         vehicle_name = self.get_parameter("vehicle_name").value
-
         # if vehicle_name == "e4":
         self.declare_parameter("wheelbase", 2.57)
         # elif vehicle_name == "e2":
@@ -125,13 +122,6 @@ class PurePursuit(Node):
         self.declare_parameter("waypoints_file", "e4_track_v2.csv")
         self.declare_parameter("stop_distance", 2.0)
 
-        ## E2-specific kick-start parameters
-        # Static-friction "kick-start": a single high accel command isn't held
-        # long enough (one 50ms tick before the next control_loop call
-        # recomputes it) for the actuator/motor controller to actually
-        # overcome stiction from a dead stop. Empirically (E2 testing),
-        # holding ~0.3 continuously for ~1s is what's needed; once rolling,
-        # the normal PID-computed accel works fine.
         self.declare_parameter("kick_start_accel", 0.3)
         self.declare_parameter("kick_start_duration", 1.0)
         self.declare_parameter(
@@ -192,12 +182,16 @@ class PurePursuit(Node):
         self.lane_width = self.get_parameter("lane_width").value
         self.declare_parameter("fx", 476.70140266418457)
         self.fx = self.get_parameter("fx").value
+        self.declare_parameter("multi_class", True)
+        self.multi_class = self.get_parameter("multi_class").value
         self.declare_parameter("fy", 476.7014265060425)
         self.fy = self.get_parameter("fy").value
         self.declare_parameter("cx", 400.0)
         self.cx = self.get_parameter("cx").value
         self.declare_parameter("cy", 300.0)
         self.cy = self.get_parameter("cy").value
+        self.declare_parameter("height_of_cones", 1)  # TODO
+        self.height_of_cones = self.get_parameter("height_of_cones").value
 
         self.declare_parameter("camera_topic", "/camera/image_raw")
         self.camera_topic = self.get_parameter("camera_topic").value
@@ -302,6 +296,8 @@ class PurePursuit(Node):
         self.read_waypoints()
 
         # Initialize
+        self.object_detected = False
+        self.object_detected_coordinate = None
         self.lat = 0.0
         self.lon = 0.0
         self.heading = 0.0
@@ -388,28 +384,24 @@ class PurePursuit(Node):
             image = self._cv_bridge.imgmsg_to_cv2(self._image_msg, "bgr8")
 
             mask = self.inference(self.lane_detection_model, image, self._dev)
+            horizon_row = int(self.cy)
+            mask[:horizon_row, :] = 0
 
             # m = mask.astype(np.uint8) * 255
             # mask_msg = self._cv_bridge.cv2_to_imgmsg(m, "mono8")
             ####################
-            class_indices = mask.astype(np.uint8)
+            if self.multi_class:
+                m = np.zeros_like(mask, dtype=np.uint8)
+                m[mask == 1] = 127  # Adjacent lane
+                m[mask == 2] = 255  # Ego lane
+            else:
+                m = mask.astype(np.uint8) * 255
 
-            normalized_mask = cv2.normalize(
-                class_indices,
-                None,
-                alpha=0,
-                beta=255,
-                norm_type=cv2.NORM_MINMAX,
-                dtype=cv2.CV_8U,
-            )
-
-            color_mask = cv2.applyColorMap(normalized_mask, cv2.COLORMAP_JET)
-
-            mask_msg = self._cv_bridge.cv2_to_imgmsg(color_mask, encoding="bgr8")
             #########################
 
-            mask_msg = self._cv_bridge.cv2_to_imgmsg(mask, encoding="bgr8")
+            # mask_msg = self._cv_bridge.cv2_to_imgmsg(mask, encoding="bgr8")
 
+            mask_msg = self._cv_bridge.cv2_to_imgmsg(m, "mono8")
             self.lane_mask_pub.publish(mask_msg)
 
     def _on_depth_image(self, msg):
@@ -433,7 +425,7 @@ class PurePursuit(Node):
             throttle_duration_sec=2.0,
         )
         self._lidar_msg = msg
-        self.detect_close_object(200)
+        self.object_detected = self.detect_close_object(3)  # measured in meters
 
     def read_waypoints(self):
         waypoints_file = self.get_parameter("waypoints_file").value
@@ -467,8 +459,18 @@ class PurePursuit(Node):
 
     # helper function for lidar obstacle detection
     def dist_3D(self, p1, p2):
-        return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2 + (p1[2] - p2[2])**2)
-    
+        return math.sqrt(
+            (p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2 + (p1[2] - p2[2]) ** 2
+        )
+
+    def turn_around_cone(self):
+
+        front_of_cone_coordinate = self.object_detected_coordinate
+        height_of_cone = self.height_of_cones
+        # X is front and Y is left
+        waypointsx = self.path_points_x
+        waypointsy = self.path_points_y
+
     def front2steer(self, f_angle):
         f_angle = max(min(f_angle, 35), -35)
         angle = abs(f_angle)
@@ -503,11 +505,16 @@ class PurePursuit(Node):
 
     # function to detect if the lidar sees something too close to the car
     def detect_close_object(self, threshold=1.0):
-        points = point_cloud2.read_points_list(self._lidar_msg, field_names=("x", "y", "z"))
+        points = point_cloud2.read_points_list(
+            self._lidar_msg, field_names=("x", "y", "z")
+        )
         for point in points:
-            if (point[1] > -100 and point[1] < 100 and point[0] > 0): # limit scan to front of car between the lanes
+            if (
+                point[1] > -1.5 and point[1] < 1.5 and point[0] > 0
+            ):  # limit scan to front of car between the lanes
                 if self.dist_3D(point, (0, 0, 0)) < threshold:
                     print("Close object detected at point:", point)
+                    self.object_detected_coordinate = point
                     return True
         return False
 
@@ -573,7 +580,7 @@ class PurePursuit(Node):
             self.get_logger().warn("Joystick Disabled, Pacmod disabled")
 
         elif joy_enable != 0 and self.pacmod_enable:
-            # exceuate controller
+            # if there is no converstion to local coordinates
             # self.path_points_x = []
             # self.path_points_y = []
             # for lon, lat in zip(self.path_points_lon_x, self.path_points_lat_y):
@@ -688,16 +695,6 @@ class PurePursuit(Node):
             pid_throttle_cmd = self.pid_speed.get_control(now, speed_error)
             pid_throttle_cmd = max(0.0, min(pid_throttle_cmd, self.max_accel))
 
-            ## E2-specific kick-start logic
-            # Kick-start: once in FORWARD gear but still near a dead stop,
-            # hold EXACTLY kick_start_accel continuously (across many ticks,
-            # not just one) for up to kick_start_duration seconds, ignoring
-            # the PID entirely during this window. A larger commanded value
-            # (e.g. the PID's max_accel-clamped output) is NOT a safe
-            # substitute here - testing showed a sustained 0.3 breaks static
-            # friction while a sustained 0.5 does not, so this must not be
-            # "at least kick_start_accel" (max() with the PID output), it
-            # must be the specific calibrated value.
             if (
                 self.vehicle_name == "e2"
                 and self.current_gear == 3
@@ -714,15 +711,9 @@ class PurePursuit(Node):
                     self.get_logger().info(f"Waiting for kick-start to complete")
                     throttle_cmd = self.kick_start_accel
                 else:
-                    # Timed out without the car moving - stop forcing it and
-                    # fall back to the plain PID output (avoid getting stuck
-                    # commanding kick_start_accel forever if something else
-                    # is actually preventing movement).
                     self.kick_start_active = False
                     throttle_cmd = pid_throttle_cmd
             else:
-                # Already rolling (or not yet in FORWARD) - clear kick-start
-                # state so it can re-arm next time the car comes to a stop.
                 self.kick_start_active = False
                 throttle_cmd = pid_throttle_cmd
 
@@ -739,7 +730,6 @@ class PurePursuit(Node):
             )
 
     def destroy_node(self):
-        # Cancel and destroy the timer to stop the control loop before shutting down
         self.timer.cancel()
         self.destroy_timer(self.timer)
 
@@ -756,37 +746,53 @@ class PurePursuit(Node):
         super().destroy_node()
 
     def load_model(self, path_to_your_model: str) -> SimpleENet:
-        model = SimpleENet()
+        # model = SimpleENet()
+        # model.load_state_dict(torch.load(path_to_your_model, weights_only=True))
+        # return model
+        model = SimpleENet(num_classes=3)
         model.load_state_dict(torch.load(path_to_your_model, weights_only=True))
-        return model
+        return model.eval()
 
     def inference(
         self, model: SimpleENet, image: np.ndarray, device: str
     ) -> np.ndarray:
-        resized = cv2.resize(image, (640, 384))
-        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-        image = gray.astype(np.float32) / 255.0
-        image = torch.from_numpy(image)
-        image = image.unsqueeze(0)
-        image = image.unsqueeze(0)
-        image = image.to(device)
-        prediction = model(image)
-        prediction = torch.argmax(prediction, dim=1)
-        prediction = prediction.squeeze(0).cpu().numpy()
-        prediction = (prediction * 255).astype(np.float32)
-        prediction = cv2.resize(prediction, (800, 600))
-        return prediction
+        # resized = cv2.resize(image, (640, 384))
+        # gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        # image = gray.astype(np.float32) / 255.0
+        # image = torch.from_numpy(image)
+        # image = image.unsqueeze(0)
+        # image = image.unsqueeze(0)
+        # image = image.to(device)
+        # prediction = model(image)
+        # prediction = torch.argmax(prediction, dim=1)
+        # prediction = prediction.squeeze(0).cpu().numpy()
+        # prediction = (prediction * 255).astype(np.float32)
+        # prediction = cv2.resize(prediction, (800, 600))
+        # return prediction
+        resized_image = cv2.resize(image, (640, 384))
+        gray_scale_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2GRAY)
+        normalize_image = gray_scale_image.astype("float32") / 255.0
+
+        # Correct tensor shape: [1, 1, 384, 640]
+        image_tensor = torch.from_numpy(normalize_image).float()
+        inputs = image_tensor.unsqueeze(0).unsqueeze(0).to(device)
+
+        set_model = model.to(device).eval()
+
+        with torch.inference_mode():
+            output = set_model(inputs)
+
+        predicted_class = torch.argmax(output, dim=1)
+        resized_prediction = torch.nn.functional.interpolate(
+            predicted_class.unsqueeze(1).float(),
+            size=(image.shape[0], image.shape[1]),
+            mode="nearest",
+        )
+        return resized_prediction.squeeze(0).squeeze(0).cpu().numpy().astype(np.uint8)
 
 
 def main(args=None):
-    # Disable rclpy's built-in SIGINT handler (default: SignalHandlerOptions.ALL).
-    # That handler shuts down the ROS context the instant Ctrl+C is pressed,
-    # racing against (and usually winning over) our own `except
-    # KeyboardInterrupt` cleanup below - which is exactly why the "disable
-    # PACMod" publish in destroy_node() was failing with "publisher's
-    # context is invalid". With signal handling disabled here, Ctrl+C falls
-    # through to Python's normal KeyboardInterrupt, raised synchronously in
-    # rclpy.spin() below, so the context is still alive when we clean up.
+
     rclpy.init(args=args, signal_handler_options=rclpy.SignalHandlerOptions.NO)
     pure_pursuit = PurePursuit()
 
@@ -805,30 +811,3 @@ if __name__ == "__main__":
 
 # TODO Potential Issues:
 # Derivative Noise Amplification
-
-
-# # Terminal 1: bring up Pacmod and Robot State Publisher
-# cd ~/gem_ws/gem_or_death
-# colcon build --symlink-install
-# ros2 launch basic_launch dbw_only.launch.py
-
-# # Terminal 2: bring up GNSS/INS only
-# cd ~/gem_ws/gem_or_death
-# colcon build --symlink-install
-# ros2 launch basic_launch gnss.launch.py
-
-# # Terminal 3: start path tracking controller
-# cd ~/gem_ws/gem_or_death
-# colcon build --symlink-install
-# ros2 launch gem_gnss_control new_pure_pursuit.launch.py
-
-# ros2 topic list
-# /ackermann_cmd = specifying control inputs like steering angle, steering rate, speed, and acceleration.
-# /camera/camera_info
-# /camera/image_raw
-# /camera/image_raw/compressed
-# /camera/image_raw/compressedDepth
-# /camera/image_raw/theora
-# /camera/image_raw/zstd
-# /clock
-# /scan/points
