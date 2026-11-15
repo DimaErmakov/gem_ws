@@ -5,3 +5,4 @@ __pycache__*/
 .vscode/
 COLCON_IGNORE
 *metadata.json
+src/vehicle_drivers/gem_gnss_control/gem_gnss_control/blob_with_color.pth

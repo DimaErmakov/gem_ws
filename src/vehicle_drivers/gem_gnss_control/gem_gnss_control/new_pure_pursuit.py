@@ -119,7 +119,7 @@ class PurePursuit(Node):
         self.declare_parameter("origin_lon", -88.2359639)
         self.declare_parameter("desired_speed", 2.6)
         self.declare_parameter("max_accel", 0.5)
-        self.declare_parameter("waypoints_file", "e4_track_v2.csv")
+        self.declare_parameter("waypoints_file", "e4_track.csv")
         self.declare_parameter("stop_distance", 2.0)
 
         self.declare_parameter("kick_start_accel", 0.3)
@@ -190,8 +190,10 @@ class PurePursuit(Node):
         self.cx = self.get_parameter("cx").value
         self.declare_parameter("cy", 300.0)
         self.cy = self.get_parameter("cy").value
-        self.declare_parameter("height_of_cones", 1)  # TODO
-        self.height_of_cones = self.get_parameter("height_of_cones").value
+        self.declare_parameter("height_of_cones_theshold", 1)  # TODO
+        self.height_of_cones_theshold = self.get_parameter(
+            "height_of_cones_theshold"
+        ).value
 
         self.declare_parameter("camera_topic", "/camera/image_raw")
         self.camera_topic = self.get_parameter("camera_topic").value
@@ -298,6 +300,8 @@ class PurePursuit(Node):
         # Initialize
         self.object_detected = False
         self.object_detected_coordinate = None
+        self.cone_detected = False
+        self.cone_detected_coordinate = None
         self.lat = 0.0
         self.lon = 0.0
         self.heading = 0.0
@@ -425,7 +429,7 @@ class PurePursuit(Node):
             throttle_duration_sec=2.0,
         )
         self._lidar_msg = msg
-        self.object_detected = self.detect_close_object(3)  # measured in meters
+        self.object_detected, self.cone_detected = self.detect_objects_and_cones(5.0)
 
     def read_waypoints(self):
         waypoints_file = self.get_parameter("waypoints_file").value
@@ -464,12 +468,59 @@ class PurePursuit(Node):
         )
 
     def turn_around_cone(self):
+        if self.cone_detected_coordinate is None:
+            return
 
-        front_of_cone_coordinate = self.object_detected_coordinate
-        height_of_cone = self.height_of_cones
-        # X is front and Y is left
-        waypointsx = self.path_points_x
-        waypointsy = self.path_points_y
+        # 1. Get current vehicle pose in map frame
+        curr_x, curr_y, curr_yaw = self.get_gem_state()
+
+        # 2. Extract cone coordinates in vehicle frame (X = front, Y = left)
+        cx_rel = self.cone_detected_coordinate[0]
+        cy_rel = self.cone_detected_coordinate[1]
+
+        # 3. Transform cone position from vehicle frame to map frame
+        cone_map_x = curr_x + cx_rel * math.cos(curr_yaw) - cy_rel * math.sin(curr_yaw)
+        cone_map_y = curr_y + cx_rel * math.sin(curr_yaw) + cy_rel * math.cos(curr_yaw)
+
+        # 4. Find the waypoint closest to the cone in the map frame
+        cone_dist_arr = [
+            math.hypot(
+                self.path_points_x[i] - cone_map_x, self.path_points_y[i] - cone_map_y
+            )
+            for i in range(len(self.path_points_x))
+        ]
+        closest_wp_idx = np.argmin(cone_dist_arr)
+
+        # 5. Define detour parameters around that waypoint index
+        num_waypoints_to_shift = 20  # Number of waypoints affected by the bypass curve
+        bypass_offset = 1.5  # Distance in meters to shift away from the cone
+
+        # Determine shift direction: if cone is to the left in vehicle frame (cy_rel > 0), shift right (-1); else shift left (+1)
+        shift_sign = -1.0 if cy_rel > 0 else 1.0
+
+        start_idx = max(0, closest_wp_idx - 5)  # Start slightly before the cone
+        end_idx = min(start_idx + num_waypoints_to_shift, len(self.path_points_x))
+
+        # 6. Apply a smooth lateral shift (using a sine bell curve) to upcoming waypoints
+        for i in range(start_idx, end_idx):
+            progress = (i - start_idx) / max(1, (end_idx - start_idx))
+            weight = math.sin(progress * math.pi)  # Peaks in the middle of the detour
+
+            # Compute normal vector perpendicular to the waypoint heading
+            yaw_rad = self.heading_to_yaw(self.path_points_heading[i])
+            nx = -math.sin(yaw_rad)  # Lateral X component (left normal)
+            ny = math.cos(yaw_rad)  # Lateral Y component (left normal)
+
+            # Shift the waypoint coordinates laterally in the map frame
+            self.path_points_x[i] += shift_sign * bypass_offset * weight * nx
+            self.path_points_y[i] += shift_sign * bypass_offset * weight * ny
+
+        self.get_logger().warn(
+            f"Cone avoided! Shifted waypoints around cone at map coords ({cone_map_x:.2f}, {cone_map_y:.2f})"
+        )
+
+        # Clear the coordinate so the car doesn't keep modifying the path on every tick
+        self.cone_detected_coordinate = None
 
     def front2steer(self, f_angle):
         f_angle = max(min(f_angle, 35), -35)
@@ -504,19 +555,44 @@ class PurePursuit(Node):
         return x, y, yaw
 
     # function to detect if the lidar sees something too close to the car
-    def detect_close_object(self, threshold=1.0):
+    def detect_objects_and_cones(self, threshold=5.0):
         points = point_cloud2.read_points_list(
             self._lidar_msg, field_names=("x", "y", "z")
         )
+        obj_detected = False
+        points_in_zone = 0
+        cone_valid = True  # Assume valid until a tall point is found
+        first_point = None
+
         for point in points:
+            # front of car, between lanes, within distance threshold
             if (
-                point[1] > -1.5 and point[1] < 1.5 and point[0] > 0
-            ):  # limit scan to front of car between the lanes
-                if self.dist_3D(point, (0, 0, 0)) < threshold:
-                    print("Close object detected at point:", point)
+                point[0] > 0
+                and -1.5 < point[1] < 1.5
+                and self.dist_3D(point, (0, 0, 0)) < threshold
+            ):
+                points_in_zone += 1
+
+                # General object detection (capture the first valid point)
+                if not obj_detected:
+                    print("First object detected at point:", point)
                     self.object_detected_coordinate = point
-                    return True
-        return False
+                    obj_detected = True
+                    first_point = point
+                print("Close object detected at point:", point)
+
+                # Veto cone detection if ANY point in the zone is above the height threshold
+                if point[2] >= self.height_of_cones_theshold:
+                    cone_valid = False
+
+        # Cone is only detected if an object is present, points exist, and NO point exceeded the height limit
+        cone_detected = obj_detected and (points_in_zone > 0) and cone_valid
+
+        if cone_detected:
+            self.cone_detected_coordinate = first_point
+            print("Close cone verified and detected at point:", first_point)
+
+        return obj_detected, cone_detected
 
     def publish_local_odom(self, x, y, yaw):
         odom = Odometry()
