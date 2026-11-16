@@ -1,0 +1,126 @@
+cd ~/gem-stop-sign-transfer
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+
+python -m pip install --no-index \
+    --find-links=./wheels-py312 "inference==1.8.4"
+
+python -c "import rclpy; from cv_bridge import CvBridge; print('ROS imports OK')"
+python test_stop_sign.py 
+
+--ros-args -p camera_topic:=/oak/rgb/image_raw
+
+ros2 topic echo /stop_sign/detections
+
+API KEY is: meB2e1C0V6tbgN5Sq88K
+-----------------------------------------------
+
+ros2 bag record /oak/rgb/image_raw /oak/rgb/left /oak/rgb/right -a 1112recording
+
+cd ~/gem_ws_gem_or_death/src
+
+ros2 topic list
+
+--------------------
+
+cd ~/gem_ws_gem_or_death
+colcon build --symlink-install
+source install/setup.bash
+ros2 launch basic_launch robot_description.launch.py
+
+cd ~/gem_ws_gem_or_death
+source install/setup.bash
+ros2 launch basic_launch sensor_init.launch.py
+
+cd ~/gem_ws_gem_or_death
+source install/setup.bash
+ros2 launch basic_launch dbw_only.launch.py
+
+cd ~/gem_ws_gem_or_death
+source install/setup.bash
+ros2 launch basic_launch gnss.launch.py
+
+cd ~/gem_ws_gem_or_death
+source install/setup.bash
+ros2 launch basic_launch dbw_joystick.launch.py
+
+cd ~/gem_ws_gem_or_death
+source install/setup.bash
+ros2 launch gem_gnss_control pure_pursuit.launch.py vehicle_name:=e4 wheelbase:=2.57
+--------------------------
+
+self.declare_parameter("kick_start_accel", 1.0)
+self.declare_parameter("kick_start_duration", 2.0)
+self.declare_parameter("kick_start_speed_threshold", 0.1)
+
+
+ros2 launch basic_launch gnss.launch.py
+ros2 launch basic_launch dbw_joystick.launch.py
+ros2 launch gem_gnss_control record_waypoints.launch.py output_file:=e4_track_v2.csv min_distance:=0.5
+
+/imu
+/insnavgeod
+/joint_states
+/joy
+/joy/set_feedback
+/navsatfix
+/pacmod/accel_cmd
+/pacmod/accel_rpt
+/pacmod/all_system_statuses
+/pacmod/brake_cmd
+/pacmod/brake_motor_rpt_1
+/pacmod/brake_motor_rpt_2
+/pacmod/brake_motor_rpt_3
+/pacmod/brake_rpt
+/pacmod/enabled
+/pacmod/from_can_bus
+/pacmod/global_cmd
+/pacmod/global_rpt
+/pacmod/headlight_cmd
+/pacmod/headlight_rpt
+/pacmod/horn_cmd
+/pacmod/horn_rpt
+/pacmod/pacmod/transition_event
+/pacmod/shift_cmd
+/pacmod/shift_rpt
+/pacmod/socket_can_receiver/transition_event
+/pacmod/socket_can_sender/transition_event
+/pacmod/steering_cmd
+/pacmod/steering_motor_rpt_1
+/pacmod/steering_motor_rpt_2
+/pacmod/steering_motor_rpt_3
+/pacmod/steering_rpt
+/pacmod/to_can_bus
+/pacmod/turn_cmd
+/pacmod/turn_rpt
+/pacmod/vehicle_speed_rpt
+/pacmod/wheel_speed_rpt
+/pacmod/wiper_cmd
+/pacmod/wiper_rpt
+/parameter_events
+/pvtgeodetic
+/robot_description
+/rosout
+/tf
+/tf_static
+/twist_gnss
+/twist_ins
+
+
+cd /home/gem/gem_ws_gem_or_death/src
+git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+cd ..
+colcon build --packages-select livox_ros_driver2
+source install/setup.bash
+
+
+
+python - <<'PY'
+import sys
+sys.path.insert(0, "/home/gem/.local/lib/python3.10/site-packages")
+import numpy
+sys.path.pop(0)
+print("Numpy:", numpy.__version__)
+from cv_bridge import CvBridge
+print("CV bridge imports OK")
+PY
