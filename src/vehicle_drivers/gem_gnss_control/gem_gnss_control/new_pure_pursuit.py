@@ -39,7 +39,6 @@ import torch
 import torch.nn as nn
 from cv_bridge import CvBridge
 import argparse
-import torch
 import cv2
 from sensor_msgs_py import point_cloud2
 
@@ -195,7 +194,7 @@ class PurePursuit(Node):
         self.height_of_cones_theshold = self.get_parameter(
             "height_of_cones_theshold"
         ).value
-
+        # TODO get topics
         self.declare_parameter("camera_topic", "/camera/image_raw")
         self.camera_topic = self.get_parameter("camera_topic").value
         self.declare_parameter("lidar_topic", "/scan/points")
@@ -685,7 +684,7 @@ class PurePursuit(Node):
             # print(f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})")
             self.get_logger().info(
                 f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})"
-            # )
+            )
             # Check distance to the FINAL waypoint in the track
             end_x = self.path_points_x[-1]
             end_y = self.path_points_y[-1]
@@ -1354,3 +1353,5 @@ if __name__ == "__main__":
 
 # TODO Potential Issues:
 # Derivative Noise Amplification
+# topics are correct
+# cone height
