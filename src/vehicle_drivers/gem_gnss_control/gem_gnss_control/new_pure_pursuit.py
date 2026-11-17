@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # ================================================================
-# Description: edited 11/16
+# Description: edited 11/17
 # Author: Zillur Rahman, Jiaming Zhang, Hang Cui, Dimitry
 # Date: 2026-09-03
 # ================================================================
@@ -450,10 +450,15 @@ class PurePursuit(Node):
             # build/ or install/.
             dirname = os.path.dirname(os.path.realpath(__file__))
             filename = os.path.join(dirname, "../waypoints", waypoints_file)
+        print(f"self.vehicle_name: {self.vehicle_name}")
+        print(f"self.wheelbase: {self.wheelbase}")
+        print(f"self.look_ahead: {self.look_ahead}")
+        self.get_logger().info(f"self.vehicle_name: {self.wheelbase}")
+        self.get_logger().info(f"self.wheelbase: {self.wheelbase}")
+        self.get_logger().info(f"self.look_ahead: {self.look_ahead}")
         self.get_logger().info(f"Loading waypoints from: {filename}")
         with open(filename) as f:
             path_points = [tuple(line) for line in csv.reader(f)]
-        print(f"self.wheelbase: {self.wheelbase}")
         self.path_points_lon_x = [float(p[0]) for p in path_points]
         self.path_points_lat_y = [float(p[1]) for p in path_points]
         self.path_points_heading = [float(p[2]) for p in path_points]
@@ -584,10 +589,12 @@ class PurePursuit(Node):
                 # General object detection (capture the first valid point)
                 if not obj_detected:
                     print("First object detected at point:", point)
+                    self.get_logger().info("First object detected at point:", point)
                     self.object_detected_coordinate = point
                     obj_detected = True
                     first_point = point
                 print("Close object detected at point:", point)
+                self.get_logger().info("Close object detected at point:", point)
 
                 # Veto cone detection if ANY point in the zone is above the height threshold
                 if point[2] >= self.height_of_cones_theshold:
@@ -598,8 +605,8 @@ class PurePursuit(Node):
 
         if cone_detected:
             self.cone_detected_coordinate = first_point
-            print("Close cone verified and detected at point:", first_point)
-
+            print("Cone verified and detected at point:", first_point)
+            self.get_logger().info("Cone verified and detected at point:", first_point)
         return obj_detected, cone_detected
 
     def publish_local_odom(self, x, y, yaw):
@@ -676,7 +683,9 @@ class PurePursuit(Node):
             self.path_points_x = np.array(self.path_points_lon_x)
             self.path_points_y = np.array(self.path_points_lat_y)
             # print(f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})")
-
+            self.get_logger().info(
+                f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})"
+            # )
             # Check distance to the FINAL waypoint in the track
             end_x = self.path_points_x[-1]
             end_y = self.path_points_y[-1]
