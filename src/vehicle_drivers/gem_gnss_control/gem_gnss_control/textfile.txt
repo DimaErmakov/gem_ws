@@ -15,12 +15,17 @@ ros2 topic echo /stop_sign/detections
 API KEY is: meB2e1C0V6tbgN5Sq88K
 -----------------------------------------------
 
-ros2 bag record /oak/rgb/image_raw /oak/rgb/left /oak/rgb/right -a 1112recording
+ros2 bag record /oak/rgb/image_raw -o final_rosbag_rightlane
 
 cd ~/gem_ws_gem_or_death/src
 
 ros2 topic list
-
+grep -rn "DEPTH_IMAGE" .
+ls -lt ~/.ros/log/latest/
+ros2 topic hz /depth_image_output_ADD
+ros2 topic hz /lane_mask_output_ADD
+ros2 topic echo /depth_image_output_ADD --field header --field encoding --field height --field width --once
+ros2 topic echo /lane_mask_output_ADD --field header --field encoding --field height --field width --once
 --------------------
 
 cd ~/gem_ws_gem_or_death
@@ -34,7 +39,14 @@ ros2 launch basic_launch sensor_init.launch.py
 
 cd ~/gem_ws_gem_or_death
 source install/setup.bash
-ros2 launch basic_launch dbw_only.launch.py
+ros2 launch basic_launch dbw_joystick.launch.py
+
+cd ~/gem_ws_gem_or_death
+source install/setup.bash
+ros2 launch gem_gnss_control pure_pursuit.launch.py vehicle_name:=e4 wheelbase:=2.57 look_ahead:=5.0
+
+
+-------------------------- 
 
 cd ~/gem_ws_gem_or_death
 source install/setup.bash
@@ -42,61 +54,55 @@ ros2 launch basic_launch gnss.launch.py
 
 cd ~/gem_ws_gem_or_death
 source install/setup.bash
-ros2 launch basic_launch dbw_joystick.launch.py
+ros2 launch basic_launch dbw_only.launch.py
 
-cd ~/gem_ws_gem_or_death
-source install/setup.bash
-ros2 launch gem_gnss_control pure_pursuit.launch.py vehicle_name:=e4 wheelbase:=2.57
---------------------------
-
-self.declare_parameter("kick_start_accel", 1.0)
-self.declare_parameter("kick_start_duration", 2.0)
-self.declare_parameter("kick_start_speed_threshold", 0.1)
 
 
 ros2 launch basic_launch gnss.launch.py
 ros2 launch basic_launch dbw_joystick.launch.py
 ros2 launch gem_gnss_control record_waypoints.launch.py output_file:=e4_track_v2.csv min_distance:=0.5
 
-/imu
-/insnavgeod
+/clicked_point
+/diagnostics
+/goal_pose
+/image_rect/ffmpeg
+/initialpose
 /joint_states
-/joy
-/joy/set_feedback
-/navsatfix
-/pacmod/accel_cmd
-/pacmod/accel_rpt
-/pacmod/all_system_statuses
-/pacmod/brake_cmd
-/pacmod/brake_motor_rpt_1
-/pacmod/brake_motor_rpt_2
-/pacmod/brake_motor_rpt_3
-/pacmod/brake_rpt
-/pacmod/enabled
-/pacmod/from_can_bus
-/pacmod/global_cmd
-/pacmod/global_rpt
-/pacmod/headlight_cmd
-/pacmod/headlight_rpt
-/pacmod/horn_cmd
-/pacmod/horn_rpt
-/pacmod/pacmod/transition_event
-/pacmod/shift_cmd
-/pacmod/shift_rpt
-/pacmod/socket_can_receiver/transition_event
-/pacmod/socket_can_sender/transition_event
-/pacmod/steering_cmd
-/pacmod/steering_motor_rpt_1
-/pacmod/steering_motor_rpt_2
-/pacmod/steering_motor_rpt_3
-/pacmod/steering_rpt
-/pacmod/to_can_bus
-/pacmod/turn_cmd
-/pacmod/turn_rpt
-/pacmod/vehicle_speed_rpt
-/pacmod/wheel_speed_rpt
-/pacmod/wiper_cmd
-/pacmod/wiper_rpt
+/livox/imu
+/livox/lidar
+/lucid_vision/camera_fl/camera_info
+/lucid_vision/camera_fl/image
+/lucid_vision/camera_rl/camera_info
+/lucid_vision/camera_rl/image
+/lucid_vision/camera_rr/camera_info
+/lucid_vision/camera_rr/image
+/oak/imu/data
+/oak/points
+/oak/rgb/camera_info
+/oak/rgb/image_raw
+/oak/rgb/image_raw/compressed
+/oak/rgb/image_raw/compressedDepth
+/oak/rgb/image_raw/ffmpeg
+/oak/rgb/image_raw/theora
+/oak/rgb/image_rect
+/oak/rgb/image_rect/compressed
+/oak/rgb/image_rect/compressedDepth
+/oak/rgb/image_rect/theora
+/oak/stereo/camera_info
+/oak/stereo/image_raw
+/oak/stereo/image_raw/compressed
+/oak/stereo/image_raw/compressedDepth
+/oak/stereo/image_raw/ffmpeg
+/oak/stereo/image_raw/theora
+/ouster/imu
+/ouster/metadata
+/ouster/nearir_image
+/ouster/os_driver/transition_event
+/ouster/points
+/ouster/range_image
+/ouster/reflec_image
+/ouster/scan
+/ouster/signal_image
 /parameter_events
 /pvtgeodetic
 /robot_description
@@ -104,7 +110,6 @@ ros2 launch gem_gnss_control record_waypoints.launch.py output_file:=e4_track_v2
 /tf
 /tf_static
 /twist_gnss
-/twist_ins
 
 
 cd /home/gem/gem_ws_gem_or_death/src
@@ -124,3 +129,25 @@ print("Numpy:", numpy.__version__)
 from cv_bridge import CvBridge
 print("CV bridge imports OK")
 PY
+
+/home/gem/gem_ws_gem_or_death/src/basic_launch/rviz/gem_e4_pp.rviz
+Class: rviz_default_plugins/Image
+      Enabled: false
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: DEPTH_IMAGE
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /oak/stereo/image_raw
+
+(sensor_msgs.msg.CameraInfo(header=std_msgs.msg.Header(stamp=builtin_interfaces.msg.Time(sec=1795115279, nanosec=243705619), frame_id='oak_rgb_camera_optical_frame'), height=480, width=768, distortion_model='rational_polynomial', d=[0.908803403377533, 0.10777730494737625, -0.00011555181117728353, 0.00016320882423315197, 0.021386317908763885, 0.8666334748268127, 0.18107722699642181, 0.012254921719431877], k=array([456.55551147,   0.        , 382.24740601,   0.        ,
+[pure_pursuit-1]        456.40646362, 242.46728516,   0.        ,   0.        ,
+[pure_pursuit-1]          1.        ]), r=array([1., 0., 0., 0., 1., 0., 0., 0., 1.]), p=array([456.55551147,   0.        , 382.24740601,   0.        ,
+[pure_pursuit-1]          0.        , 456.40646362, 242.46728516,   0.        ,
+[pure_pursuit-1]          0.        ,   0.        ,   1.        ,   0.        ]), binning_x=0, binning_y=0, roi=sensor_msgs.msg.RegionOfInterest(x_offset=0, y_offset=0, height=0, width=0, do_rectify=False)),
+
