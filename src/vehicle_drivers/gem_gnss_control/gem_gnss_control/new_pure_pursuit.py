@@ -637,8 +637,8 @@ class PurePursuit(Node):
         self.height_of_cones_theshold = self.get_parameter(
             "height_of_cones_theshold"
         ).value
-        # TODO get topics
-        self.declare_parameter("camera_topic", "/oak/rgb/image_raw")
+
+        self.declare_parameter("camera_topic", "/camera/image_raw")
         self.camera_topic = self.get_parameter("camera_topic").value
         self.declare_parameter("lidar_topic", "/ouster/points")
         self.lidar_topic = self.get_parameter("lidar_topic").value
@@ -891,8 +891,6 @@ class PurePursuit(Node):
             # build/ or install/.
             dirname = os.path.dirname(os.path.realpath(__file__))
             filename = os.path.join(dirname, "../waypoints", waypoints_file)
-        self.get_logger().info(f"self.wheelbase: {self.wheelbase}")
-        self.get_logger().info(f"self.look_ahead: {self.look_ahead}")
         self.get_logger().info(f"Loading waypoints from: {filename}")
         with open(filename) as f:
             path_points = [tuple(line) for line in csv.reader(f)]
@@ -1026,12 +1024,10 @@ class PurePursuit(Node):
                 # General object detection (capture the first valid point)
                 if not obj_detected:
                     print("First object detected at point:", point)
-                    self.get_logger().info(f"First object detected at point: {point}")
                     self.object_detected_coordinate = point
                     obj_detected = True
                     first_point = point
                 print("Close object detected at point:", point)
-                self.get_logger().info(f"Close object detected at point: {point}")
 
                 # Veto cone detection if ANY point in the zone is above the height threshold
                 if point[2] >= self.height_of_cones_theshold:
@@ -1042,10 +1038,8 @@ class PurePursuit(Node):
 
         if cone_detected:
             self.cone_detected_coordinate = first_point
-            print("Cone verified and detected at point:", first_point)
-            self.get_logger().info(
-                f"Cone verified and detected at point: {first_point}"
-            )
+            print("Close cone verified and detected at point:", first_point)
+
         return obj_detected, cone_detected
 
     def publish_local_odom(self, x, y, yaw):
@@ -1333,3 +1327,6 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+
+# TODO Potential Issues:
+# Derivative Noise Amplification
