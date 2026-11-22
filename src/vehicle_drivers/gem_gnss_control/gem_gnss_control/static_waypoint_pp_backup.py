@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # ================================================================
-# Description: GNSS waypoints tracker using PID and pure pursuit in ROS2
+# Description: edited 11/19
 # Author: Zillur Rahman, Jiaming Zhang, Hang Cui, Dimitry
 # Date: 2026-09-03
 # ================================================================
@@ -35,14 +35,458 @@ from sensor_msgs.msg import CameraInfo, Image, NavSatFix, PointCloud2
 from septentrio_gnss_driver.msg import INSNavGeod
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PointStamped
-from simple_enet import SimpleENet
+import torch
+import torch.nn as nn
 from cv_bridge import CvBridge
 import argparse
-import torch
 import cv2
 from sensor_msgs_py import point_cloud2
-from tf2_ros import Buffer, TransformListener
-from scipy.spatial.transform import Rotation as R_scipy
+
+
+class InitialBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, bias=False, relu=True):
+        super().__init__()
+
+        if relu:
+            activation = nn.ReLU
+        else:
+            activation = nn.PReLU
+
+        self.f_1 = nn.Conv2d(
+            in_channels, out_channels - 1, kernel_size=4, stride=2, padding=1, bias=bias
+        )  # kernal_size =4, stride =2, padding =1
+        self.f_2 = nn.MaxPool2d(kernel_size=4, stride=2, padding=1)
+        self.m = nn.BatchNorm2d(out_channels)
+        self.activate = activation()
+
+        # self.output = nn.Sequential(concat, batch_norm, activate)
+
+    def forward(self, x):
+        # return self.output(x)
+        f1_out = self.f_1(x)
+        f2_out = self.f_2(x)
+        concat = torch.cat((f1_out, f2_out), 1)
+
+        batch_norm = self.m(concat)
+        return self.activate(batch_norm)
+
+
+class RegularBottleneck(nn.Module):
+    def __init__(
+        self,
+        channels,
+        internal_ratio=4,
+        kernel_size=3,
+        padding=0,
+        dilation=1,
+        asymmetric=False,
+        dropout_prob=0,
+        bias=False,
+        relu=True,
+    ):
+        super().__init__()
+
+        if internal_ratio <= 1 or internal_ratio > channels:
+            raise RuntimeError(
+                "Value out of range. Expected value in the "
+                "interval [1, {0}], got internal_scale={1}.".format(
+                    channels, internal_ratio
+                )
+            )
+
+        internal_channels = channels // internal_ratio
+
+        if relu:
+            activation = nn.ReLU
+        else:
+            activation = nn.PReLU
+
+        self.ext_conv1 = nn.Sequential(
+            nn.Conv2d(channels, internal_channels, kernel_size=1, stride=1, bias=bias),
+            nn.BatchNorm2d(internal_channels),
+            activation(),
+        )
+
+        if asymmetric:
+            self.ext_conv2 = nn.Sequential(
+                nn.Conv2d(
+                    internal_channels,
+                    internal_channels,
+                    kernel_size=(kernel_size, 1),
+                    stride=1,
+                    padding=(padding, 0),
+                    dilation=dilation,
+                    bias=bias,
+                ),
+                nn.BatchNorm2d(internal_channels),
+                activation(),
+                nn.Conv2d(
+                    internal_channels,
+                    internal_channels,
+                    kernel_size=(1, kernel_size),
+                    stride=1,
+                    padding=(0, padding),
+                    dilation=dilation,
+                    bias=bias,
+                ),
+                nn.BatchNorm2d(internal_channels),
+                activation(),
+            )
+        else:
+            self.ext_conv2 = nn.Sequential(
+                nn.Conv2d(
+                    internal_channels,
+                    internal_channels,
+                    kernel_size=kernel_size,
+                    stride=1,
+                    padding=padding,
+                    dilation=dilation,
+                    bias=bias,
+                ),
+                nn.BatchNorm2d(internal_channels),
+                activation(),
+            )
+
+        self.ext_conv3 = nn.Sequential(
+            nn.Conv2d(internal_channels, channels, kernel_size=1, stride=1, bias=bias),
+            nn.BatchNorm2d(channels),
+            activation(),
+        )
+
+        self.ext_regul = nn.Dropout2d(p=dropout_prob)
+        self.out_activation = activation()
+
+    def forward(self, x):
+        main = x
+        ext = self.ext_conv1(x)
+        ext = self.ext_conv2(ext)
+        ext = self.ext_conv3(ext)
+        ext = self.ext_regul(ext)
+        out = main + ext
+        return self.out_activation(out)
+
+
+class DownsamplingBottleneck(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        internal_ratio=4,
+        return_indices=False,
+        dropout_prob=0,
+        bias=False,
+        relu=True,
+    ):
+        super().__init__()
+
+        self.return_indices = return_indices
+
+        if internal_ratio <= 1 or internal_ratio > in_channels:
+            raise RuntimeError(
+                "Value out of range. Expected value in the "
+                "interval [1, {0}], got internal_scale={1}. ".format(
+                    in_channels, internal_ratio
+                )
+            )
+
+        internal_channels = in_channels // internal_ratio
+
+        if relu:
+            activation = nn.ReLU
+        else:
+            activation = nn.PReLU
+
+        self.main_max1 = nn.MaxPool2d(2, stride=2, return_indices=return_indices)
+
+        self.ext_conv1 = nn.Sequential(
+            nn.Conv2d(
+                in_channels, internal_channels, kernel_size=2, stride=2, bias=bias
+            ),
+            nn.BatchNorm2d(internal_channels),
+            activation(),
+        )
+
+        self.ext_conv2 = nn.Sequential(
+            nn.Conv2d(
+                internal_channels,
+                internal_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=bias,
+            ),
+            nn.BatchNorm2d(internal_channels),
+            activation(),
+        )
+
+        self.ext_conv3 = nn.Sequential(
+            nn.Conv2d(
+                internal_channels, out_channels, kernel_size=1, stride=1, bias=bias
+            ),
+            nn.BatchNorm2d(out_channels),
+            activation(),
+        )
+
+        self.ext_regul = nn.Dropout2d(p=dropout_prob)
+        self.out_activation = activation()
+
+    def forward(self, x):
+        if self.return_indices:
+            main, max_indices = self.main_max1(x)
+        else:
+            main = self.main_max1(x)
+
+        ext = self.ext_conv1(x)
+        ext = self.ext_conv2(ext)
+        ext = self.ext_conv3(ext)
+        ext = self.ext_regul(ext)
+
+        n, ch_ext, h, w = ext.size()
+        ch_main = main.size()[1]
+        padding = torch.zeros(n, ch_ext - ch_main, h, w)
+
+        if main.is_cuda:
+            padding = padding.cuda()
+
+        main = torch.cat((main, padding), 1)
+        out = main + ext
+
+        return self.out_activation(out), max_indices
+
+
+class UpsamplingBottleneck(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        internal_ratio=4,
+        dropout_prob=0,
+        bias=False,
+        relu=True,
+    ):
+        super().__init__()
+
+        if internal_ratio <= 1 or internal_ratio > in_channels:
+            raise RuntimeError(
+                "Value out of range. Expected value in the "
+                "interval [1, {0}], got internal_scale={1}. ".format(
+                    in_channels, internal_ratio
+                )
+            )
+
+        internal_channels = in_channels // internal_ratio
+
+        if relu:
+            activation = nn.ReLU
+        else:
+            activation = nn.PReLU
+
+        self.main_conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias),
+            nn.BatchNorm2d(out_channels),
+        )
+
+        self.main_unpool1 = nn.MaxUnpool2d(kernel_size=2)
+
+        self.ext_conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, internal_channels, kernel_size=1, bias=bias),
+            nn.BatchNorm2d(internal_channels),
+            activation(),
+        )
+
+        self.ext_tconv1 = nn.ConvTranspose2d(
+            internal_channels, internal_channels, kernel_size=2, stride=2, bias=bias
+        )
+        self.ext_tconv1_bnorm = nn.BatchNorm2d(internal_channels)
+        self.ext_tconv1_activation = activation()
+
+        self.ext_conv2 = nn.Sequential(
+            nn.Conv2d(internal_channels, out_channels, kernel_size=1, bias=bias),
+            nn.BatchNorm2d(out_channels),
+            activation(),
+        )
+
+        self.ext_regul = nn.Dropout2d(p=dropout_prob)
+        self.out_activation = activation()
+
+    def forward(self, x, max_indices, output_size):
+        main = self.main_conv1(x)
+        main = self.main_unpool1(main, max_indices, output_size=output_size)
+
+        ext = self.ext_conv1(x)
+        ext = self.ext_tconv1(ext, output_size=output_size)
+        ext = self.ext_tconv1_bnorm(ext)
+        ext = self.ext_tconv1_activation(ext)
+        ext = self.ext_conv2(ext)
+        ext = self.ext_regul(ext)
+
+        out = main + ext
+        return self.out_activation(out)
+
+
+class SimpleENet(nn.Module):
+    def __init__(self, num_classes=3, encoder_relu=False, decoder_relu=True):
+        super(SimpleENet, self).__init__()
+
+        self.initial_block = InitialBlock(1, 16, relu=encoder_relu)
+
+        # Stage 1
+        self.downsample1_0 = DownsamplingBottleneck(
+            16, 64, return_indices=True, dropout_prob=0.01, relu=encoder_relu
+        )
+        self.regular1_1 = RegularBottleneck(
+            64, padding=1, dropout_prob=0.01, relu=encoder_relu
+        )
+        self.regular1_2 = RegularBottleneck(
+            64, padding=1, dropout_prob=0.01, relu=encoder_relu
+        )
+        self.regular1_3 = RegularBottleneck(
+            64, padding=1, dropout_prob=0.01, relu=encoder_relu
+        )
+        self.regular1_4 = RegularBottleneck(
+            64, padding=1, dropout_prob=0.01, relu=encoder_relu
+        )
+
+        # Stage 2
+        self.downsample2_0 = DownsamplingBottleneck(
+            64, 128, return_indices=True, dropout_prob=0.1, relu=encoder_relu
+        )
+        self.regular2_1 = RegularBottleneck(
+            128, padding=1, dropout_prob=0.1, relu=encoder_relu
+        )
+        self.dilated2_2 = RegularBottleneck(
+            128, dilation=2, padding=2, dropout_prob=0.1, relu=encoder_relu
+        )
+        self.asymmetric2_3 = RegularBottleneck(
+            128,
+            kernel_size=5,
+            padding=2,
+            asymmetric=True,
+            dropout_prob=0.1,
+            relu=encoder_relu,
+        )
+        self.dilated2_4 = RegularBottleneck(
+            128, dilation=4, padding=4, dropout_prob=0.1, relu=encoder_relu
+        )
+        self.regular2_5 = RegularBottleneck(
+            128, padding=1, dropout_prob=0.1, relu=encoder_relu
+        )
+        self.dilated2_6 = RegularBottleneck(
+            128, dilation=8, padding=8, dropout_prob=0.1, relu=encoder_relu
+        )
+        self.asymmetric2_7 = RegularBottleneck(
+            128,
+            kernel_size=5,
+            asymmetric=True,
+            padding=2,
+            dropout_prob=0.1,
+            relu=encoder_relu,
+        )
+        self.dilated2_8 = RegularBottleneck(
+            128, dilation=16, padding=16, dropout_prob=0.1, relu=encoder_relu
+        )
+
+        # Stage 3
+        self.regular3_0 = RegularBottleneck(
+            128, padding=1, dropout_prob=0.1, relu=encoder_relu
+        )
+        self.dilated3_1 = RegularBottleneck(
+            128, dilation=2, padding=2, dropout_prob=0.1, relu=encoder_relu
+        )
+        self.asymmetric3_2 = RegularBottleneck(
+            128,
+            kernel_size=5,
+            padding=2,
+            asymmetric=True,
+            dropout_prob=0.1,
+            relu=encoder_relu,
+        )
+        self.dilated3_3 = RegularBottleneck(
+            128, dilation=4, padding=4, dropout_prob=0.1, relu=encoder_relu
+        )
+        self.regular3_4 = RegularBottleneck(
+            128, padding=1, dropout_prob=0.1, relu=encoder_relu
+        )
+        self.dilated3_5 = RegularBottleneck(
+            128, dilation=8, padding=8, dropout_prob=0.1, relu=encoder_relu
+        )
+        self.asymmetric3_6 = RegularBottleneck(
+            128,
+            kernel_size=5,
+            asymmetric=True,
+            padding=2,
+            dropout_prob=0.1,
+            relu=encoder_relu,
+        )
+        self.dilated3_7 = RegularBottleneck(
+            128, dilation=16, padding=16, dropout_prob=0.1, relu=encoder_relu
+        )
+
+        # Decoder
+        self.upsample4_0 = UpsamplingBottleneck(
+            128, 64, dropout_prob=0.1, relu=decoder_relu
+        )
+        self.regular4_1 = RegularBottleneck(
+            64, padding=1, dropout_prob=0.1, relu=decoder_relu
+        )
+        self.regular4_2 = RegularBottleneck(
+            64, padding=1, dropout_prob=0.1, relu=decoder_relu
+        )
+        self.upsample5_0 = UpsamplingBottleneck(
+            64, 16, dropout_prob=0.1, relu=decoder_relu
+        )
+        self.regular5_1 = RegularBottleneck(
+            16, padding=1, dropout_prob=0.1, relu=decoder_relu
+        )
+        self.transposed_conv = nn.ConvTranspose2d(
+            16, num_classes, kernel_size=3, stride=2, padding=1, bias=False
+        )
+
+    def forward(self, x):
+        # Initial block
+        input_size = x.size()
+        x = self.initial_block(x)
+
+        # Stage 1
+        stage1_input_size = x.size()
+        x, max_indices1_0 = self.downsample1_0(x)
+        x = self.regular1_1(x)
+        x = self.regular1_2(x)
+        x = self.regular1_3(x)
+        x = self.regular1_4(x)
+
+        # Stage 2
+        stage2_input_size = x.size()
+        x, max_indices2_0 = self.downsample2_0(x)
+        x = self.regular2_1(x)
+        x = self.dilated2_2(x)
+        x = self.asymmetric2_3(x)
+        x = self.dilated2_4(x)
+        x = self.regular2_5(x)
+        x = self.dilated2_6(x)
+        x = self.asymmetric2_7(x)
+        x = self.dilated2_8(x)
+
+        # Stage 3
+        x = self.regular3_0(x)
+        x = self.dilated3_1(x)
+        x = self.asymmetric3_2(x)
+        x = self.dilated3_3(x)
+        x = self.regular3_4(x)
+        x = self.dilated3_5(x)
+        x = self.asymmetric3_6(x)
+        x = self.dilated3_7(x)
+
+        # Decoder
+        x = self.upsample4_0(x, max_indices2_0, output_size=stage2_input_size)
+        x = self.regular4_1(x)
+        x = self.regular4_2(x)
+        x = self.upsample5_0(x, max_indices1_0, output_size=stage1_input_size)
+        x = self.regular5_1(x)
+        x = self.transposed_conv(x, output_size=input_size)
+
+        return x
+
 
 # Initialize pygame for joystick
 pygame.init()
@@ -110,10 +554,7 @@ class PurePursuit(Node):
 
         self.declare_parameter("vehicle_name", "e4")
         vehicle_name = self.get_parameter("vehicle_name").value
-        # if vehicle_name == "e4":
         self.declare_parameter("wheelbase", 2.57)
-        # elif vehicle_name == "e2":
-        #     self.declare_parameter("wheelbase", 1.75)
         self.declare_parameter("rate_hz", 20)
         self.declare_parameter("look_ahead", 5.0)
         self.declare_parameter("offset", 1.26)
@@ -158,8 +599,6 @@ class PurePursuit(Node):
         self.kick_start_speed_threshold = self.get_parameter(
             "kick_start_speed_threshold"
         ).value
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.desired_speed = min(
             5.0, self.get_parameter("desired_speed").value
@@ -184,49 +623,53 @@ class PurePursuit(Node):
         self.sun_lane_model = self.get_parameter("run_lane_model").value
         self.declare_parameter("lane_width", 3)
         self.lane_width = self.get_parameter("lane_width").value
-        self.declare_parameter("fx", 476.70140266418457)
+        self.declare_parameter("fx", 456.55551147)
         self.fx = self.get_parameter("fx").value
         self.declare_parameter("multi_class", True)
         self.multi_class = self.get_parameter("multi_class").value
-        self.declare_parameter("fy", 476.7014265060425)
+        self.declare_parameter("fy", 456.40646362)
         self.fy = self.get_parameter("fy").value
-        self.declare_parameter("cx", 400.0)
+        self.declare_parameter("cx", 382.24740601)
         self.cx = self.get_parameter("cx").value
-        self.declare_parameter("cy", 300.0)
+        self.declare_parameter("cy", 242.46728516)
         self.cy = self.get_parameter("cy").value
-        self.declare_parameter("height_of_cones", 1)  # TODO
-        self.height_of_cones = self.get_parameter("height_of_cones").value
-
-        self.declare_parameter("camera_topic", "/camera/image_raw")
+        self.declare_parameter("height_of_cones_theshold", 1)  # real height is 0.75
+        self.height_of_cones_theshold = self.get_parameter(
+            "height_of_cones_theshold"
+        ).value
+        # TODO get topics
+        self.declare_parameter("camera_topic", "/oak/rgb/image_raw")
         self.camera_topic = self.get_parameter("camera_topic").value
-        self.declare_parameter("lidar_topic", "/scan/points")
+        self.declare_parameter("lidar_topic", "/ouster/points")
         self.lidar_topic = self.get_parameter("lidar_topic").value
-        self.declare_parameter("camera_info_topic", "/camera/camera_info")
-        self.camera_info_topic = self.get_parameter("camera_info_topic").value
+        # self.declare_parameter("camera_info_topic", "/oak/rgb/camera_info")
+        # self.camera_info_topic = self.get_parameter("camera_info_topic").value
 
-        self.declare_parameter("depth_output_topic", "/depth_image_output")
+        self.declare_parameter("depth_output_topic", "/depth_image_output_ADD")
         self.depth_output_topic = self.get_parameter("depth_output_topic").value
 
-        self.declare_parameter(
-            "depth_camera_topic", "/oak/rgb/image_raw/compressedDepth"
-        )
+        self.declare_parameter("depth_camera_topic", "/oak/stereo/image_raw")
         self.depth_camera_topic = self.get_parameter("depth_camera_topic").value
-        self.declare_parameter("lane_mask_topic", "/lane_mask_output")
+
+        self.declare_parameter("lane_mask_topic", "/lane_mask_output_ADD")
         self.lane_mask_topic = self.get_parameter("lane_mask_topic").value
 
-        self.declare_parameter("lane_detection_model_path", "blob_with_color.pth")
+        self.declare_parameter(
+            "lane_detection_model_path",
+            "/home/gem/gem_ws_gem_or_death/src/vehicle_drivers/gem_gnss_control/gem_gnss_control/blob_with_color.pth",
+        )
         self.lane_detection_model_path = self.get_parameter(
             "lane_detection_model_path"
         ).value
 
         if self.sun_lane_model:
             try:
+                self.get_logger().info("[green]loaded SimpleEnet :o[/green]")
                 self.lane_detection_model = self.load_model(
                     self.lane_detection_model_path
                 )
-                if self.lane_detection_model is not None:
-                    self.lane_detection_model = self.lane_detection_model.to(self._dev)
-                    self.get_logger().info("[green]loaded SimpleEnet :o[/green]")
+                # if self.lane_detection_model is not None:
+                # self.lane_detection_model = self.lane_detection_model.to(self._dev)
             except Exception as e:
                 self.get_logger().error(f"could not load SimpleEnet model x_X: {e}")
                 self.lane_detection_model = None
@@ -264,9 +707,9 @@ class PurePursuit(Node):
         self.create_subscription(
             PointCloud2, self.lidar_topic, self._on_lidar_points, 10
         )
-        self.create_subscription(
-            CameraInfo, self.camera_info_topic, self._on_camera_info, 10
-        )
+        # self.create_subscription(
+        #     CameraInfo, self.camera_info_topic, self._on_camera_info, 10
+        # )
 
         # Publishers
         self.global_pub = self.create_publisher(GlobalCmd, "/pacmod/global_cmd", 10)
@@ -302,6 +745,8 @@ class PurePursuit(Node):
         # Initialize
         self.object_detected = False
         self.object_detected_coordinate = None
+        self.cone_detected = False
+        self.cone_detected_coordinate = None
         self.lat = 0.0
         self.lon = 0.0
         self.heading = 0.0
@@ -334,31 +779,6 @@ class PurePursuit(Node):
     def enable_callback(self, msg):
         self.pacmod_enable = msg.data
 
-    def get_transform_matrices(self, target_frame, source_frame):
-        """
-        Looks up the rigid body transform from source_frame to target_frame
-        and returns a 3x3 Rotation matrix and 3x1 Translation vector.
-        """
-        try:
-            trans = self.tf_buffer.lookup_transform(
-                target_frame, source_frame, self.timer
-            )
-
-            # Translation
-            t = trans.transform.translation
-            T = np.array([t.x, t.y, t.z], dtype=np.float32).reshape(3, 1)
-
-            # Rotation Matrix from Quaternion
-            q = trans.transform.rotation
-            R = R_scipy.from_quat([q.x, q.y, q.z, q.w]).as_matrix().astype(np.float32)
-
-            return R, T
-        except Exception as e:
-            self.get_logger().warn(
-                f"Could not get transform from {source_frame} to {target_frame}: {e}"
-            )
-            return None, None
-
     def global_rpt_callback(self, msg):
         self.pacmod_override_active = msg.override_active
 
@@ -383,34 +803,8 @@ class PurePursuit(Node):
     def shift_rpt_callback(self, msg):
         self.current_gear = msg.output
 
-    def _on_camera_info(self, msg):
-        """Callback for camera_info to extract and print the intrinsic matrix K."""
-        # msg.K is a flat list/array of 9 elements: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
-        intrinsic_matrix = np.array(msg.K).reshape(3, 3)
-
-        self.get_logger().info(
-            f"Camera Intrinsic Matrix (K):\n"
-            f"[{intrinsic_matrix[0,0]:.2f}, {intrinsic_matrix[0,1]:.2f}, {intrinsic_matrix[0,2]:.2f}]\n"
-            f"[{intrinsic_matrix[1,0]:.2f}, {intrinsic_matrix[1,1]:.2f}, {intrinsic_matrix[1,2]:.2f}]\n"
-            f"[{intrinsic_matrix[2,0]:.2f}, {intrinsic_matrix[2,1]:.2f}, {intrinsic_matrix[2,2]:.2f}]",
-            throttle_duration_sec=5.0,
-        )
-        print(
-            f"Camera Intrinsic Matrix (K):\n"
-            f"[{intrinsic_matrix[0,0]:.2f}, {intrinsic_matrix[0,1]:.2f}, {intrinsic_matrix[0,2]:.2f}]\n"
-            f"[{intrinsic_matrix[1,0]:.2f}, {intrinsic_matrix[1,1]:.2f}, {intrinsic_matrix[1,2]:.2f}]\n"
-            f"[{intrinsic_matrix[2,0]:.2f}, {intrinsic_matrix[2,1]:.2f}, {intrinsic_matrix[2,2]:.2f}]"
-        )
-        camera_frame = "right_camera_link"  # or 'left_camera_link'
-
-        # 1. Look up individual links from TF
-        R_cam2front, T_cam2front = self.get_transform_matrices(
-            "front_camera_link", camera_frame
-        )
-        R_front2veh, T_front2veh = self.get_transform_matrices(
-            "base_link", "front_camera_link"
-        )
-        print(R_cam2front, T_cam2front, R_front2veh, T_front2veh)
+    # def _on_camera_info(self, msg):
+    #     intrinsic_matrix = np.array(msg)
 
     def _on_camera_image(self, msg):
         """Callback for standard RGB camera frames."""
@@ -430,9 +824,12 @@ class PurePursuit(Node):
             # mask_msg = self._cv_bridge.cv2_to_imgmsg(m, "mono8")
             ####################
             if self.multi_class:
-                m = np.zeros_like(mask, dtype=np.uint8)
-                m[mask == 1] = 127  # Adjacent lane
-                m[mask == 2] = 255  # Ego lane
+                # m = np.zeros_like(mask, dtype=np.uint8)
+                # m[mask == 1] = 127  # Adjacent lane
+                # m[mask == 2] = 255  # Ego lane
+
+                # kalil's version
+                m = np.choose(mask, (0, 127, 255)).astype(np.uint8)
             else:
                 m = mask.astype(np.uint8) * 255
 
@@ -443,19 +840,35 @@ class PurePursuit(Node):
             mask_msg = self._cv_bridge.cv2_to_imgmsg(m, "mono8")
             self.lane_mask_pub.publish(mask_msg)
 
-    def _on_depth_image(self, msg):
-        """Callback for depth camera frames."""
+    def _on_depth_image(self, msg: Image):
+        """Callback for depth camera frames; publishes clean 2D depth (meters) as 32FC1."""
         self.get_logger().info(
             f"Received depth image | Encoding: {msg.encoding}",
             throttle_duration_sec=2.0,
         )
         self._depth_msg = msg
-        depth_image = self._cv_bridge.imgmsg_to_cv2(
-            self._depth_msg, desired_encoding="passthrough"
-        )
-        self.depth_pub.publish(
-            self._cv_bridge.cv2_to_imgmsg(depth_image, encoding="32FC1")
-        )
+
+        if msg.encoding == "16UC1":
+            raw = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding="16UC1")
+            depth_m = raw.astype(np.float32) / 1000.0
+            depth_m[raw == 0] = np.nan
+        elif msg.encoding == "32FC1":
+            raw = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
+            depth_m = raw.astype(np.float32).copy()
+            depth_m[~np.isfinite(depth_m) | (depth_m <= 0.0)] = np.nan
+        else:
+            self.get_logger().warning(f"Unsupported depth encoding: {msg.encoding}")
+            return
+
+        # Optional: clip absurd stereo noise/outliers for waypoint generation
+        depth_m[depth_m > 30.0] = np.nan
+
+        # Store the 2D (H, W) array in meters
+        self._depth_m = depth_m
+
+        out_msg = self._cv_bridge.cv2_to_imgmsg(depth_m, encoding="32FC1")
+        out_msg.header = msg.header
+        self.depth_pub.publish(out_msg)
 
     def _on_lidar_points(self, msg):
         """Callback for 3D LiDAR point cloud data (/scan/points)."""
@@ -464,7 +877,7 @@ class PurePursuit(Node):
             throttle_duration_sec=2.0,
         )
         self._lidar_msg = msg
-        self.object_detected = self.detect_close_object(3)  # measured in meters
+        self.object_detected, self.cone_detected = self.detect_objects_and_cones(5.0)
 
     def read_waypoints(self):
         waypoints_file = self.get_parameter("waypoints_file").value
@@ -478,6 +891,8 @@ class PurePursuit(Node):
             # build/ or install/.
             dirname = os.path.dirname(os.path.realpath(__file__))
             filename = os.path.join(dirname, "../waypoints", waypoints_file)
+        self.get_logger().info(f"self.wheelbase: {self.wheelbase}")
+        self.get_logger().info(f"self.look_ahead: {self.look_ahead}")
         self.get_logger().info(f"Loading waypoints from: {filename}")
         with open(filename) as f:
             path_points = [tuple(line) for line in csv.reader(f)]
@@ -503,12 +918,59 @@ class PurePursuit(Node):
         )
 
     def turn_around_cone(self):
+        if self.cone_detected_coordinate is None:
+            return
 
-        front_of_cone_coordinate = self.object_detected_coordinate
-        height_of_cone = self.height_of_cones
-        # X is front and Y is left
-        waypointsx = self.path_points_x
-        waypointsy = self.path_points_y
+        # 1. Get current vehicle pose in map frame
+        curr_x, curr_y, curr_yaw = self.get_gem_state()
+
+        # 2. Extract cone coordinates in vehicle frame (X = front, Y = left)
+        cx_rel = self.cone_detected_coordinate[0]
+        cy_rel = self.cone_detected_coordinate[1]
+
+        # 3. Transform cone position from vehicle frame to map frame
+        cone_map_x = curr_x + cx_rel * math.cos(curr_yaw) - cy_rel * math.sin(curr_yaw)
+        cone_map_y = curr_y + cx_rel * math.sin(curr_yaw) + cy_rel * math.cos(curr_yaw)
+
+        # 4. Find the waypoint closest to the cone in the map frame
+        cone_dist_arr = [
+            math.hypot(
+                self.path_points_x[i] - cone_map_x, self.path_points_y[i] - cone_map_y
+            )
+            for i in range(len(self.path_points_x))
+        ]
+        closest_wp_idx = np.argmin(cone_dist_arr)
+
+        # 5. Define detour parameters around that waypoint index
+        num_waypoints_to_shift = 20  # Number of waypoints affected by the bypass curve
+        bypass_offset = 1.5  # Distance in meters to shift away from the cone
+
+        # Determine shift direction: if cone is to the left in vehicle frame (cy_rel > 0), shift right (-1); else shift left (+1)
+        shift_sign = -1.0 if cy_rel > 0 else 1.0
+
+        start_idx = max(0, closest_wp_idx - 5)  # Start slightly before the cone
+        end_idx = min(start_idx + num_waypoints_to_shift, len(self.path_points_x))
+
+        # 6. Apply a smooth lateral shift (using a sine bell curve) to upcoming waypoints
+        for i in range(start_idx, end_idx):
+            progress = (i - start_idx) / max(1, (end_idx - start_idx))
+            weight = math.sin(progress * math.pi)  # Peaks in the middle of the detour
+
+            # Compute normal vector perpendicular to the waypoint heading
+            yaw_rad = self.heading_to_yaw(self.path_points_heading[i])
+            nx = -math.sin(yaw_rad)  # Lateral X component (left normal)
+            ny = math.cos(yaw_rad)  # Lateral Y component (left normal)
+
+            # Shift the waypoint coordinates laterally in the map frame
+            self.path_points_x[i] += shift_sign * bypass_offset * weight * nx
+            self.path_points_y[i] += shift_sign * bypass_offset * weight * ny
+
+        self.get_logger().warn(
+            f"Cone avoided! Shifted waypoints around cone at map coords ({cone_map_x:.2f}, {cone_map_y:.2f})"
+        )
+
+        # Clear the coordinate so the car doesn't keep modifying the path on every tick
+        self.cone_detected_coordinate = None
 
     def front2steer(self, f_angle):
         f_angle = max(min(f_angle, 35), -35)
@@ -543,19 +1005,49 @@ class PurePursuit(Node):
         return x, y, yaw
 
     # function to detect if the lidar sees something too close to the car
-    def detect_close_object(self, threshold=1.0):
+    def detect_objects_and_cones(self, threshold=5.0):
         points = point_cloud2.read_points_list(
             self._lidar_msg, field_names=("x", "y", "z")
         )
+        obj_detected = False
+        points_in_zone = 0
+        cone_valid = True  # Assume valid until a tall point is found
+        first_point = None
+
         for point in points:
+            # front of car, between lanes, within distance threshold
             if (
-                point[1] > -1.5 and point[1] < 1.5 and point[0] > 0
-            ):  # limit scan to front of car between the lanes
-                if self.dist_3D(point, (0, 0, 0)) < threshold:
-                    print("Close object detected at point:", point)
+                point[0] > 0
+                and -1.5 < point[1] < 1.5
+                and self.dist_3D(point, (0, 0, 0)) < threshold
+            ):
+                points_in_zone += 1
+
+                # General object detection (capture the first valid point)
+                if not obj_detected:
+                    print("First object detected at point:", point)
+                    self.get_logger().info(f"First object detected at point: {point}")
                     self.object_detected_coordinate = point
-                    return True
-        return False
+                    obj_detected = True
+                    first_point = point
+                print("Close object detected at point:", point)
+                self.get_logger().info(f"Close object detected at point: {point}")
+                self.get_logger().info("Close object detected at point:", point)
+
+                # Veto cone detection if ANY point in the zone is above the height threshold
+                if point[2] >= self.height_of_cones_theshold:
+                    cone_valid = False
+
+        # Cone is only detected if an object is present, points exist, and NO point exceeded the height limit
+        cone_detected = obj_detected and (points_in_zone > 0) and cone_valid
+
+        if cone_detected:
+            self.cone_detected_coordinate = first_point
+            print("Cone verified and detected at point:", first_point)
+            self.get_logger().info(
+                f"Cone verified and detected at point: {first_point}"
+            )
+        return obj_detected, cone_detected
 
     def publish_local_odom(self, x, y, yaw):
         odom = Odometry()
@@ -619,19 +1111,12 @@ class PurePursuit(Node):
             self.get_logger().warn("Joystick Disabled, Pacmod disabled")
 
         elif joy_enable != 0 and self.pacmod_enable:
-            # if there is no converstion to local coordinates
-            # self.path_points_x = []
-            # self.path_points_y = []
-            # for lon, lat in zip(self.path_points_lon_x, self.path_points_lat_y):
-            #     x, y, _ = pm.geodetic2enu(lat, lon, 0, self.olat, self.olon, 0)
-            #     self.path_points_x.append(x)
-            #     self.path_points_y.append(y)
-            # self.path_points_x = np.array(self.path_points_x)
-            # self.path_points_y = np.array(self.path_points_y)
             self.path_points_x = np.array(self.path_points_lon_x)
             self.path_points_y = np.array(self.path_points_lat_y)
-            print(f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})")
-
+            # print(f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})")
+            self.get_logger().info(
+                f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})"
+            )
             # Check distance to the FINAL waypoint in the track
             end_x = self.path_points_x[-1]
             end_y = self.path_points_y[-1]
@@ -789,7 +1274,9 @@ class PurePursuit(Node):
         # model.load_state_dict(torch.load(path_to_your_model, weights_only=True))
         # return model
         model = SimpleENet(num_classes=3)
-        model.load_state_dict(torch.load(path_to_your_model, weights_only=True))
+        model.load_state_dict(
+            torch.load(path_to_your_model, map_location="cpu", weights_only=True)
+        )
         return model.eval()
 
     def inference(
@@ -833,7 +1320,6 @@ class PurePursuit(Node):
 def main(args=None):
 
     rclpy.init(args=args, signal_handler_options=rclpy.SignalHandlerOptions.NO)
-
     pure_pursuit = PurePursuit()
 
     try:
@@ -848,6 +1334,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-
-# TODO Potential Issues:
-# Derivative Noise Amplification
