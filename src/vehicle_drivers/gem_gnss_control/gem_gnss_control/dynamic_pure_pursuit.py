@@ -39,6 +39,24 @@ from geometry_msgs.msg import PointStamped
 import torch
 from cv_bridge import CvBridge
 from sensor_msgs_py import point_cloud2
+import sys
+import logging
+
+LaneDetection_DIR = (
+    "/home/dermakov/Documents/fa26_ece484_mp1_team_cobbledtogether_group_52/"
+    "LaneAssist/src/LaneDetection"
+)
+if LaneDetection_DIR not in sys.path:
+    sys.path.append(LaneDetection_DIR)
+from detect import LaneDetection
+
+LaneKeeping_DIR = (
+    "/home/dermakov/Documents/fa26_ece484_mp1_team_cobbledtogether_group_52/"
+    "LaneAssist/src/LaneKeeping"
+)
+if LaneKeeping_DIR not in sys.path:
+    sys.path.append(LaneKeeping_DIR)
+from lanekeeping import LaneKeeping
 
 # Initialize pygame for joystick
 pygame.init()
@@ -183,6 +201,11 @@ class PurePursuit(Node):
         self.cx = self.get_parameter("cx").value
         self.declare_parameter("cy", 242.46728516)
         self.cy = self.get_parameter("cy").value
+        self.declare_parameter("img_width", 768)
+        self.declare_parameter("img_height", 480)
+
+        self._img_width = self.get_parameter("img_width").value
+        self._img_height = self.get_parameter("img_height").value
         self.declare_parameter("height_of_cones_theshold", 1)  # real height is 0.75
         self.height_of_cones_theshold = self.get_parameter(
             "height_of_cones_theshold"
@@ -204,6 +227,10 @@ class PurePursuit(Node):
             Image, self.depth_camera_topic, self._on_depth_image, 10
         )
         self.depth_pub = self.create_publisher(Image, self.depth_output_topic, 10)
+
+        self.declare_parameter("lane_fit_topic", "/lane_fit_topic_ADD")
+        self.lane_fit_topic = self.get_parameter("lane_fit_topic").value
+        self.lane_fit_pub = self.create_publisher(Image, self.lane_fit_topic, 10)
 
         # Subscriptions
         self.create_subscription(NavSatFix, "/navsatfix", self.gnss_callback, 10)
@@ -329,6 +356,90 @@ class PurePursuit(Node):
 
     # def _on_camera_info(self, msg):
     #     intrinsic_matrix = np.array(msg)
+    def pixel_to_vehicle_frame(self, u, v, depth):
+        X_cam = (u - self.cx) * depth / self.fx
+        # Y_cam = (v - self.cy) * depth / self.fy
+
+        x_veh = depth
+        y_veh = -X_cam
+
+        return x_veh, y_veh
+
+    def get_depth_at(
+        self,
+        depth_image: np.ndarray | None,
+        u: float,
+        v: float,
+        default_depth: float = 2.0,
+        min_depth: float = 0.05,
+        max_depth: float | None = None,
+        window_size: int = 1,
+    ) -> float:
+
+        if depth_image is None or getattr(depth_image, "ndim", 0) != 2:
+            self.get_logger().warn(
+                "Depth image is None or not 2D; returning default depth.",
+                throttle_duration_sec=2.0,
+            )
+            return default_depth
+
+        try:
+            uu = int(round(u))
+            vv = int(round(v))
+            height, width = depth_image.shape
+
+            if not (0 <= vv < height and 0 <= uu < width):
+                return default_depth
+
+            if window_size <= 1:
+                d = float(depth_image[vv, uu])
+                if not np.isfinite(d) or d < min_depth:
+                    return default_depth
+                if max_depth is not None and d > max_depth:
+                    return default_depth
+                return d
+
+            half = window_size // 2
+            v0, v1 = max(0, vv - half), min(height, vv + half + 1)
+            u0, u1 = max(0, uu - half), min(width, uu + half + 1)
+
+            patch = np.asarray(depth_image[v0:v1, u0:u1], dtype=np.float64)
+            valid = patch[np.isfinite(patch) & (patch >= min_depth)]
+            if max_depth is not None:
+                valid = valid[valid <= max_depth]
+
+            if valid.size == 0:
+                return default_depth
+
+            return float(np.median(valid))
+
+        except (TypeError, ValueError, IndexError) as exc:
+            self.get_logger().debug(f"Error extracting depth at ({u}, {v}): {exc}")
+            return default_depth
+
+    def desired_lane_to_waypoints(self, desired_lane, depth_map):
+        """Convert the LaneKeeping desired lane (one pixel column per row) into
+        vehicle-frame waypoints ordered near to far.
+
+        Returns the waypoints and the matching pixel locations for visualization.
+        """
+        if desired_lane is None:
+            print("No lane detected")
+            return [], []
+
+        rows = self._lane_keeper.plot_y  # bottom (near) to top (far)
+        waypoints = []
+        pixels = []
+
+        for u, v in zip(desired_lane, rows):
+            if not (0 <= u < self._img_width):
+                continue
+            depth = self.get_depth_at(depth_map, u, v)
+            x, y = self.pixel_to_vehicle_frame(u, v, depth)
+            waypoints.append([float(x), float(y)])
+            pixels.append((int(round(u)), int(round(v))))
+
+        return waypoints, pixels
 
     def _on_camera_image(self, msg):
         """Callback for standard RGB camera frames."""
@@ -337,6 +448,18 @@ class PurePursuit(Node):
             throttle_duration_sec=2.0,
         )
         self._image_msg = msg
+        lane_logger = logging.getLogger("LaneKeeping")
+        self._lane_keeper = LaneKeeping(
+            self._img_width,
+            self._img_height,
+            lane_logger,
+        )
+        self._lane_detector = LaneDetection(
+            self._img_width,
+            self._img_height,
+            self._lane_keeper,
+        )
+        # TODO
 
     def _on_depth_image(self, msg: Image):
         """Callback for depth camera frames; publishes clean 2D depth (meters) as 32FC1."""

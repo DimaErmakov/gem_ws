@@ -15,7 +15,9 @@ ros2 topic echo /stop_sign/detections
 API KEY is: meB2e1C0V6tbgN5Sq88K
 -----------------------------------------------
 
-ros2 bag record /oak/rgb/image_raw -o final_rosbag_rightlane
+ros2 bag record /oak/rgb/image_raw -o december_rosbag
+ros2 topic hz /lane_mask_output_ADD
+ros2 topic echo /lane_mask_output_ADD --field header --field encoding --field height --field width --once
 
 cd ~/gem_ws_gem_or_death/src
 
@@ -23,9 +25,8 @@ ros2 topic list
 grep -rn "DEPTH_IMAGE" .
 ls -lt ~/.ros/log/latest/
 ros2 topic hz /depth_image_output_ADD
-ros2 topic hz /lane_mask_output_ADD
 ros2 topic echo /depth_image_output_ADD --field header --field encoding --field height --field width --once
-ros2 topic echo /lane_mask_output_ADD --field header --field encoding --field height --field width --once
+ros2 topic echo /oak/stereo/image_raw --once --field encoding
 --------------------
 
 cd ~/gem_ws_gem_or_death
