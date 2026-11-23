@@ -653,6 +653,21 @@ class PurePursuit(Node):
             )
         return obj_detected, cone_detected
 
+    def publish_local_odom(self, x, y, yaw):
+        odom = Odometry()
+        odom.header.stamp = self.get_clock().now().to_msg()
+        odom.header.frame_id = "map"
+        odom.child_frame_id = "base_link"
+        odom.pose.pose.position.x = x
+        odom.pose.pose.position.y = y
+        qx, qy, qz, qw = quaternion_from_yaw(yaw)
+        odom.pose.pose.orientation.x = qx
+        odom.pose.pose.orientation.y = qy
+        odom.pose.pose.orientation.z = qz
+        odom.pose.pose.orientation.w = qw
+        odom.twist.twist.linear.x = self.speed
+        self.local_odom_pub.publish(odom)
+
     def publish_target_point(self, x, y):
         pt = PointStamped()
         pt.header.stamp = self.get_clock().now().to_msg()
@@ -664,6 +679,10 @@ class PurePursuit(Node):
 
     def control_loop(self):
         joy_enable = self.check_joystick_enable()
+
+        # curr_x, curr_y, curr_yaw = self.get_gem_state()
+
+        # self.publish_local_odom(curr_x, curr_y, curr_yaw)
 
         if joy_enable == 1 and not self.pacmod_enable:
             # joystick enable when vehicle disabled
@@ -698,6 +717,18 @@ class PurePursuit(Node):
             self.get_logger().warn("Joystick Disabled, Pacmod disabled")
 
         elif joy_enable != 0 and self.pacmod_enable:
+            # self.path_points_x = np.array(self.path_points_lon_x)
+            # self.path_points_y = np.array(self.path_points_lat_y)
+            # self.get_logger().info(
+            #     f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})"
+            # )
+            # # Check distance to the FINAL waypoint in the track
+            # end_x = self.path_points_x[-1]
+            # end_y = self.path_points_y[-1]
+            # dist_to_end = self.dist((end_x, end_y), (curr_x, curr_y))
+
+            # # Trigger stopping sequence if close to final waypoint or already in stopping sequence
+            # if dist_to_end <= self.stop_dist_threshold or self.is_stopping:
             if self.finished:
                 return
 
@@ -778,7 +809,21 @@ class PurePursuit(Node):
                 if self.current_brake > 0.50:
                     self.gear_cmd.command = 3  # FORWARD
                     self.gear_pub.publish(self.gear_cmd)
+            # for i in range(self.wp_size):
+            #     self.dist_arr[i] = self.dist(
+            #         (self.path_points_x[i], self.path_points_y[i]), (curr_x, curr_y)
+            #     )
 
+            # self.goal = np.argmin(self.dist_arr)
+            # ld = self.look_ahead + max(0.0, self.speed - 2.5) * 2
+            # for i in range(self.goal, self.wp_size):
+            #     if self.dist_arr[i] > ld:
+            #         self.goal = i
+            #         break
+            # # TODO
+            # target_x = self.path_points_x[self.goal]
+            # target_y = self.path_points_y[self.goal]
+            # target_yaw = self.path_points_heading[self.goal]
             # No lane this cycle: no throttle, keep PACMod enabled
             if self.path_points_x.size == 0:
                 self.get_logger().warn(
@@ -809,6 +854,7 @@ class PurePursuit(Node):
             target_x = float(path_x[self.goal])
             target_y = float(path_y[self.goal])
             self.publish_target_point(target_x, target_y)
+            # alpha = math.atan2(target_y - curr_y, target_x - curr_x) - curr_yaw
             alpha = math.atan2(target_y, target_x)
             curvature = 0.0 if self.speed < 0.2 else 2.0 * math.sin(alpha) / ld
             steering_angle = math.atan(self.wheelbase * curvature)
@@ -883,7 +929,6 @@ def main(args=None):
     pure_pursuit = PurePursuit()
 
     try:
-        # Spin until the vehicle has stopped at the start point
         while rclpy.ok() and not pure_pursuit.finished:
             rclpy.spin_once(pure_pursuit, timeout_sec=0.05)
     except KeyboardInterrupt:
