@@ -58,10 +58,23 @@ if LaneKeeping_DIR not in sys.path:
     sys.path.append(LaneKeeping_DIR)
 from lanekeeping import LaneKeeping
 
+DEPTH_ANYTHING_DIR = "/home/dermakov/Documents/fa26_ece484_mp1_team_cobbledtogether_group_52/Depth-Anything-V2"
+if DEPTH_ANYTHING_DIR not in sys.path:
+    sys.path.append(DEPTH_ANYTHING_DIR)
+
+try:
+    from depth_anything_v2.dpt import DepthAnythingV2
+
+    HAS_LOCAL_DEPTH_ANYTHING = True
+except ImportError:
+    HAS_LOCAL_DEPTH_ANYTHING = False
 # GPS finish is armed only after the vehicle leaves this radius around the
 # start point, so the program does not finish at the start. Not a ROS parameter.
 START_ZONE_RADIUS = 5.0
-
+weights_path = (
+    "/home/dermakov/Documents/fa26_ece484_mp1_team_cobbledtogether_group_52/"
+    "Depth-Anything-V2/checkpoints/depth_anything_v2_vits.pth"
+)
 # Initialize pygame for joystick
 pygame.init()
 pygame.joystick.init()
@@ -242,6 +255,48 @@ class PurePursuit(Node):
 
         self._cv_bridge = CvBridge()
         self._depth_m = None
+        self._dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._depth_model = None
+        self._depth_msg = None
+
+        if HAS_LOCAL_DEPTH_ANYTHING:
+            try:
+                model_configs = {
+                    "vits": {
+                        "encoder": "vits",
+                        "features": 64,
+                        "out_channels": [48, 96, 192, 384],
+                    }
+                }
+
+                self._depth_model = DepthAnythingV2(**model_configs["vits"])
+
+                if os.path.exists(weights_path):
+                    self._depth_model.load_state_dict(
+                        torch.load(weights_path, map_location="cpu")
+                    )
+
+                    self._depth_model = self._depth_model.to(self._dev).eval()
+
+                    self.get_logger().info(
+                        "[green]Loaded local Depth Anything V2 model successfully offline![/green]"
+                    )
+                else:
+                    self.get_logger().error(
+                        f"Depth checkpoint not found at: {weights_path}"
+                    )
+                    self._depth_model = None
+
+            except Exception as e:
+                self.get_logger().error(
+                    f"Could not load local Depth Anything V2 model: {e}"
+                )
+                self._depth_model = None
+
+        else:
+            self.get_logger().error(
+                f"Could not import depth_anything_v2 from {DEPTH_ANYTHING_DIR}"
+            )
 
         # Latest camera-derived waypoints in vehicle frame (x forward, y left), near to far
         self.path_points_x = np.array([])
