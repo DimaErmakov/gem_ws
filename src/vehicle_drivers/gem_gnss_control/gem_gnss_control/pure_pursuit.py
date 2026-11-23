@@ -42,18 +42,20 @@ from sensor_msgs_py import point_cloud2
 import sys
 import logging
 
-LaneDetection_DIR = (
-    "/home/dermakov/Documents/fa26_ece484_mp1_team_cobbledtogether_group_52/"
-    "LaneAssist/src/LaneDetection"
-)
+# LaneDetection_DIR = (
+#     "/home/dermakov/Documents/fa26_ece484_mp1_team_cobbledtogether_group_52/"
+#     "LaneAssist/src/LaneDetection"
+# )
+LaneDetection_DIR = "/home/gem/gem_ws_gem_or_death/" "LaneAssist/src/LaneDetection"
 if LaneDetection_DIR not in sys.path:
     sys.path.append(LaneDetection_DIR)
 from detect import LaneDetection
 
-LaneKeeping_DIR = (
-    "/home/dermakov/Documents/fa26_ece484_mp1_team_cobbledtogether_group_52/"
-    "LaneAssist/src/LaneKeeping"
-)
+# LaneKeeping_DIR = (
+#     "/home/dermakov/Documents/fa26_ece484_mp1_team_cobbledtogether_group_52/"
+#     "LaneAssist/src/LaneKeeping"
+# )
+LaneKeeping_DIR = "/home/gem/gem_ws_gem_or_death/" "LaneAssist/src/LaneKeeping"
 if LaneKeeping_DIR not in sys.path:
     sys.path.append(LaneKeeping_DIR)
 from lanekeeping import LaneKeeping
