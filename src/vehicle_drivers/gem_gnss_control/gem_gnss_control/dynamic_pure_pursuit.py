@@ -30,463 +30,15 @@ from pacmod2_msgs.msg import (
     SystemRptInt,
 )
 
+# "/home/gem/gem_ws_gem_or_death/src/vehicle_drivers/gem_gnss_control/gem_gnss_control/blob_with_color.pth",
 # NEW IMPORTS
 from sensor_msgs.msg import CameraInfo, Image, NavSatFix, PointCloud2
 from septentrio_gnss_driver.msg import INSNavGeod
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PointStamped
 import torch
-import torch.nn as nn
 from cv_bridge import CvBridge
-import argparse
-import cv2
 from sensor_msgs_py import point_cloud2
-
-
-class InitialBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, bias=False, relu=True):
-        super().__init__()
-
-        if relu:
-            activation = nn.ReLU
-        else:
-            activation = nn.PReLU
-
-        self.f_1 = nn.Conv2d(
-            in_channels, out_channels - 1, kernel_size=4, stride=2, padding=1, bias=bias
-        )  # kernal_size =4, stride =2, padding =1
-        self.f_2 = nn.MaxPool2d(kernel_size=4, stride=2, padding=1)
-        self.m = nn.BatchNorm2d(out_channels)
-        self.activate = activation()
-
-        # self.output = nn.Sequential(concat, batch_norm, activate)
-
-    def forward(self, x):
-        # return self.output(x)
-        f1_out = self.f_1(x)
-        f2_out = self.f_2(x)
-        concat = torch.cat((f1_out, f2_out), 1)
-
-        batch_norm = self.m(concat)
-        return self.activate(batch_norm)
-
-
-class RegularBottleneck(nn.Module):
-    def __init__(
-        self,
-        channels,
-        internal_ratio=4,
-        kernel_size=3,
-        padding=0,
-        dilation=1,
-        asymmetric=False,
-        dropout_prob=0,
-        bias=False,
-        relu=True,
-    ):
-        super().__init__()
-
-        if internal_ratio <= 1 or internal_ratio > channels:
-            raise RuntimeError(
-                "Value out of range. Expected value in the "
-                "interval [1, {0}], got internal_scale={1}.".format(
-                    channels, internal_ratio
-                )
-            )
-
-        internal_channels = channels // internal_ratio
-
-        if relu:
-            activation = nn.ReLU
-        else:
-            activation = nn.PReLU
-
-        self.ext_conv1 = nn.Sequential(
-            nn.Conv2d(channels, internal_channels, kernel_size=1, stride=1, bias=bias),
-            nn.BatchNorm2d(internal_channels),
-            activation(),
-        )
-
-        if asymmetric:
-            self.ext_conv2 = nn.Sequential(
-                nn.Conv2d(
-                    internal_channels,
-                    internal_channels,
-                    kernel_size=(kernel_size, 1),
-                    stride=1,
-                    padding=(padding, 0),
-                    dilation=dilation,
-                    bias=bias,
-                ),
-                nn.BatchNorm2d(internal_channels),
-                activation(),
-                nn.Conv2d(
-                    internal_channels,
-                    internal_channels,
-                    kernel_size=(1, kernel_size),
-                    stride=1,
-                    padding=(0, padding),
-                    dilation=dilation,
-                    bias=bias,
-                ),
-                nn.BatchNorm2d(internal_channels),
-                activation(),
-            )
-        else:
-            self.ext_conv2 = nn.Sequential(
-                nn.Conv2d(
-                    internal_channels,
-                    internal_channels,
-                    kernel_size=kernel_size,
-                    stride=1,
-                    padding=padding,
-                    dilation=dilation,
-                    bias=bias,
-                ),
-                nn.BatchNorm2d(internal_channels),
-                activation(),
-            )
-
-        self.ext_conv3 = nn.Sequential(
-            nn.Conv2d(internal_channels, channels, kernel_size=1, stride=1, bias=bias),
-            nn.BatchNorm2d(channels),
-            activation(),
-        )
-
-        self.ext_regul = nn.Dropout2d(p=dropout_prob)
-        self.out_activation = activation()
-
-    def forward(self, x):
-        main = x
-        ext = self.ext_conv1(x)
-        ext = self.ext_conv2(ext)
-        ext = self.ext_conv3(ext)
-        ext = self.ext_regul(ext)
-        out = main + ext
-        return self.out_activation(out)
-
-
-class DownsamplingBottleneck(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        internal_ratio=4,
-        return_indices=False,
-        dropout_prob=0,
-        bias=False,
-        relu=True,
-    ):
-        super().__init__()
-
-        self.return_indices = return_indices
-
-        if internal_ratio <= 1 or internal_ratio > in_channels:
-            raise RuntimeError(
-                "Value out of range. Expected value in the "
-                "interval [1, {0}], got internal_scale={1}. ".format(
-                    in_channels, internal_ratio
-                )
-            )
-
-        internal_channels = in_channels // internal_ratio
-
-        if relu:
-            activation = nn.ReLU
-        else:
-            activation = nn.PReLU
-
-        self.main_max1 = nn.MaxPool2d(2, stride=2, return_indices=return_indices)
-
-        self.ext_conv1 = nn.Sequential(
-            nn.Conv2d(
-                in_channels, internal_channels, kernel_size=2, stride=2, bias=bias
-            ),
-            nn.BatchNorm2d(internal_channels),
-            activation(),
-        )
-
-        self.ext_conv2 = nn.Sequential(
-            nn.Conv2d(
-                internal_channels,
-                internal_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                bias=bias,
-            ),
-            nn.BatchNorm2d(internal_channels),
-            activation(),
-        )
-
-        self.ext_conv3 = nn.Sequential(
-            nn.Conv2d(
-                internal_channels, out_channels, kernel_size=1, stride=1, bias=bias
-            ),
-            nn.BatchNorm2d(out_channels),
-            activation(),
-        )
-
-        self.ext_regul = nn.Dropout2d(p=dropout_prob)
-        self.out_activation = activation()
-
-    def forward(self, x):
-        if self.return_indices:
-            main, max_indices = self.main_max1(x)
-        else:
-            main = self.main_max1(x)
-
-        ext = self.ext_conv1(x)
-        ext = self.ext_conv2(ext)
-        ext = self.ext_conv3(ext)
-        ext = self.ext_regul(ext)
-
-        n, ch_ext, h, w = ext.size()
-        ch_main = main.size()[1]
-        padding = torch.zeros(n, ch_ext - ch_main, h, w)
-
-        if main.is_cuda:
-            padding = padding.cuda()
-
-        main = torch.cat((main, padding), 1)
-        out = main + ext
-
-        return self.out_activation(out), max_indices
-
-
-class UpsamplingBottleneck(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        internal_ratio=4,
-        dropout_prob=0,
-        bias=False,
-        relu=True,
-    ):
-        super().__init__()
-
-        if internal_ratio <= 1 or internal_ratio > in_channels:
-            raise RuntimeError(
-                "Value out of range. Expected value in the "
-                "interval [1, {0}], got internal_scale={1}. ".format(
-                    in_channels, internal_ratio
-                )
-            )
-
-        internal_channels = in_channels // internal_ratio
-
-        if relu:
-            activation = nn.ReLU
-        else:
-            activation = nn.PReLU
-
-        self.main_conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias),
-            nn.BatchNorm2d(out_channels),
-        )
-
-        self.main_unpool1 = nn.MaxUnpool2d(kernel_size=2)
-
-        self.ext_conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, internal_channels, kernel_size=1, bias=bias),
-            nn.BatchNorm2d(internal_channels),
-            activation(),
-        )
-
-        self.ext_tconv1 = nn.ConvTranspose2d(
-            internal_channels, internal_channels, kernel_size=2, stride=2, bias=bias
-        )
-        self.ext_tconv1_bnorm = nn.BatchNorm2d(internal_channels)
-        self.ext_tconv1_activation = activation()
-
-        self.ext_conv2 = nn.Sequential(
-            nn.Conv2d(internal_channels, out_channels, kernel_size=1, bias=bias),
-            nn.BatchNorm2d(out_channels),
-            activation(),
-        )
-
-        self.ext_regul = nn.Dropout2d(p=dropout_prob)
-        self.out_activation = activation()
-
-    def forward(self, x, max_indices, output_size):
-        main = self.main_conv1(x)
-        main = self.main_unpool1(main, max_indices, output_size=output_size)
-
-        ext = self.ext_conv1(x)
-        ext = self.ext_tconv1(ext, output_size=output_size)
-        ext = self.ext_tconv1_bnorm(ext)
-        ext = self.ext_tconv1_activation(ext)
-        ext = self.ext_conv2(ext)
-        ext = self.ext_regul(ext)
-
-        out = main + ext
-        return self.out_activation(out)
-
-
-class SimpleENet(nn.Module):
-    def __init__(self, num_classes=3, encoder_relu=False, decoder_relu=True):
-        super(SimpleENet, self).__init__()
-
-        self.initial_block = InitialBlock(1, 16, relu=encoder_relu)
-
-        # Stage 1
-        self.downsample1_0 = DownsamplingBottleneck(
-            16, 64, return_indices=True, dropout_prob=0.01, relu=encoder_relu
-        )
-        self.regular1_1 = RegularBottleneck(
-            64, padding=1, dropout_prob=0.01, relu=encoder_relu
-        )
-        self.regular1_2 = RegularBottleneck(
-            64, padding=1, dropout_prob=0.01, relu=encoder_relu
-        )
-        self.regular1_3 = RegularBottleneck(
-            64, padding=1, dropout_prob=0.01, relu=encoder_relu
-        )
-        self.regular1_4 = RegularBottleneck(
-            64, padding=1, dropout_prob=0.01, relu=encoder_relu
-        )
-
-        # Stage 2
-        self.downsample2_0 = DownsamplingBottleneck(
-            64, 128, return_indices=True, dropout_prob=0.1, relu=encoder_relu
-        )
-        self.regular2_1 = RegularBottleneck(
-            128, padding=1, dropout_prob=0.1, relu=encoder_relu
-        )
-        self.dilated2_2 = RegularBottleneck(
-            128, dilation=2, padding=2, dropout_prob=0.1, relu=encoder_relu
-        )
-        self.asymmetric2_3 = RegularBottleneck(
-            128,
-            kernel_size=5,
-            padding=2,
-            asymmetric=True,
-            dropout_prob=0.1,
-            relu=encoder_relu,
-        )
-        self.dilated2_4 = RegularBottleneck(
-            128, dilation=4, padding=4, dropout_prob=0.1, relu=encoder_relu
-        )
-        self.regular2_5 = RegularBottleneck(
-            128, padding=1, dropout_prob=0.1, relu=encoder_relu
-        )
-        self.dilated2_6 = RegularBottleneck(
-            128, dilation=8, padding=8, dropout_prob=0.1, relu=encoder_relu
-        )
-        self.asymmetric2_7 = RegularBottleneck(
-            128,
-            kernel_size=5,
-            asymmetric=True,
-            padding=2,
-            dropout_prob=0.1,
-            relu=encoder_relu,
-        )
-        self.dilated2_8 = RegularBottleneck(
-            128, dilation=16, padding=16, dropout_prob=0.1, relu=encoder_relu
-        )
-
-        # Stage 3
-        self.regular3_0 = RegularBottleneck(
-            128, padding=1, dropout_prob=0.1, relu=encoder_relu
-        )
-        self.dilated3_1 = RegularBottleneck(
-            128, dilation=2, padding=2, dropout_prob=0.1, relu=encoder_relu
-        )
-        self.asymmetric3_2 = RegularBottleneck(
-            128,
-            kernel_size=5,
-            padding=2,
-            asymmetric=True,
-            dropout_prob=0.1,
-            relu=encoder_relu,
-        )
-        self.dilated3_3 = RegularBottleneck(
-            128, dilation=4, padding=4, dropout_prob=0.1, relu=encoder_relu
-        )
-        self.regular3_4 = RegularBottleneck(
-            128, padding=1, dropout_prob=0.1, relu=encoder_relu
-        )
-        self.dilated3_5 = RegularBottleneck(
-            128, dilation=8, padding=8, dropout_prob=0.1, relu=encoder_relu
-        )
-        self.asymmetric3_6 = RegularBottleneck(
-            128,
-            kernel_size=5,
-            asymmetric=True,
-            padding=2,
-            dropout_prob=0.1,
-            relu=encoder_relu,
-        )
-        self.dilated3_7 = RegularBottleneck(
-            128, dilation=16, padding=16, dropout_prob=0.1, relu=encoder_relu
-        )
-
-        # Decoder
-        self.upsample4_0 = UpsamplingBottleneck(
-            128, 64, dropout_prob=0.1, relu=decoder_relu
-        )
-        self.regular4_1 = RegularBottleneck(
-            64, padding=1, dropout_prob=0.1, relu=decoder_relu
-        )
-        self.regular4_2 = RegularBottleneck(
-            64, padding=1, dropout_prob=0.1, relu=decoder_relu
-        )
-        self.upsample5_0 = UpsamplingBottleneck(
-            64, 16, dropout_prob=0.1, relu=decoder_relu
-        )
-        self.regular5_1 = RegularBottleneck(
-            16, padding=1, dropout_prob=0.1, relu=decoder_relu
-        )
-        self.transposed_conv = nn.ConvTranspose2d(
-            16, num_classes, kernel_size=3, stride=2, padding=1, bias=False
-        )
-
-    def forward(self, x):
-        # Initial block
-        input_size = x.size()
-        x = self.initial_block(x)
-
-        # Stage 1
-        stage1_input_size = x.size()
-        x, max_indices1_0 = self.downsample1_0(x)
-        x = self.regular1_1(x)
-        x = self.regular1_2(x)
-        x = self.regular1_3(x)
-        x = self.regular1_4(x)
-
-        # Stage 2
-        stage2_input_size = x.size()
-        x, max_indices2_0 = self.downsample2_0(x)
-        x = self.regular2_1(x)
-        x = self.dilated2_2(x)
-        x = self.asymmetric2_3(x)
-        x = self.dilated2_4(x)
-        x = self.regular2_5(x)
-        x = self.dilated2_6(x)
-        x = self.asymmetric2_7(x)
-        x = self.dilated2_8(x)
-
-        # Stage 3
-        x = self.regular3_0(x)
-        x = self.dilated3_1(x)
-        x = self.asymmetric3_2(x)
-        x = self.dilated3_3(x)
-        x = self.regular3_4(x)
-        x = self.dilated3_5(x)
-        x = self.asymmetric3_6(x)
-        x = self.dilated3_7(x)
-
-        # Decoder
-        x = self.upsample4_0(x, max_indices2_0, output_size=stage2_input_size)
-        x = self.regular4_1(x)
-        x = self.regular4_2(x)
-        x = self.upsample5_0(x, max_indices1_0, output_size=stage1_input_size)
-        x = self.regular5_1(x)
-        x = self.transposed_conv(x, output_size=input_size)
-
-        return x
-
 
 # Initialize pygame for joystick
 pygame.init()
@@ -619,8 +171,6 @@ class PurePursuit(Node):
         )
 
         self.goal = 0
-        self.declare_parameter("run_lane_model", True)
-        self.sun_lane_model = self.get_parameter("run_lane_model").value
         self.declare_parameter("lane_width", 3)
         self.lane_width = self.get_parameter("lane_width").value
         self.declare_parameter("fx", 456.55551147)
@@ -637,7 +187,6 @@ class PurePursuit(Node):
         self.height_of_cones_theshold = self.get_parameter(
             "height_of_cones_theshold"
         ).value
-        # TODO get topics
         self.declare_parameter("camera_topic", "/oak/rgb/image_raw")
         self.camera_topic = self.get_parameter("camera_topic").value
         self.declare_parameter("lidar_topic", "/ouster/points")
@@ -651,30 +200,11 @@ class PurePursuit(Node):
         self.declare_parameter("depth_camera_topic", "/oak/stereo/image_raw")
         self.depth_camera_topic = self.get_parameter("depth_camera_topic").value
 
-        self.declare_parameter("lane_mask_topic", "/lane_mask_output_ADD")
-        self.lane_mask_topic = self.get_parameter("lane_mask_topic").value
-
-        self.declare_parameter(
-            "lane_detection_model_path",
-            "/home/gem/gem_ws_gem_or_death/src/vehicle_drivers/gem_gnss_control/gem_gnss_control/blob_with_color.pth",
+        self.create_subscription(
+            Image, self.depth_camera_topic, self._on_depth_image, 10
         )
-        self.lane_detection_model_path = self.get_parameter(
-            "lane_detection_model_path"
-        ).value
-
-        if self.sun_lane_model:
-            try:
-                self.get_logger().info("[green]loaded SimpleEnet :o[/green]")
-                self.lane_detection_model = self.load_model(
-                    self.lane_detection_model_path
-                )
-                # if self.lane_detection_model is not None:
-                # self.lane_detection_model = self.lane_detection_model.to(self._dev)
-            except Exception as e:
-                self.get_logger().error(f"could not load SimpleEnet model x_X: {e}")
-                self.lane_detection_model = None
-        else:
-            self.lane_detection_model = None
+        self.lane_mask_pub = self.create_publisher(Image, self.lane_mask_topic, 10)
+        self.depth_pub = self.create_publisher(Image, self.depth_output_topic, 10)
 
         # Subscriptions
         self.create_subscription(NavSatFix, "/navsatfix", self.gnss_callback, 10)
@@ -702,9 +232,6 @@ class PurePursuit(Node):
         # Sensor Subscriptions based on parsed arguments
         self.create_subscription(Image, self.camera_topic, self._on_camera_image, 10)
         self.create_subscription(
-            Image, self.depth_camera_topic, self._on_depth_image, 10
-        )
-        self.create_subscription(
             PointCloud2, self.lidar_topic, self._on_lidar_points, 10
         )
         # self.create_subscription(
@@ -720,8 +247,6 @@ class PurePursuit(Node):
         self.steer_pub = self.create_publisher(
             PositionWithSpeed, "/pacmod/steering_cmd", 10
         )
-        self.lane_mask_pub = self.create_publisher(Image, self.lane_mask_topic, 10)
-        self.depth_pub = self.create_publisher(Image, self.depth_output_topic, 10)
 
         self.local_odom_pub = self.create_publisher(Odometry, "/gem/local_odom", 10)
         self.target_point_pub = self.create_publisher(
@@ -813,32 +338,6 @@ class PurePursuit(Node):
             throttle_duration_sec=2.0,
         )
         self._image_msg = msg
-        if self.lane_detection_model is not None:
-            image = self._cv_bridge.imgmsg_to_cv2(self._image_msg, "bgr8")
-
-            mask = self.inference(self.lane_detection_model, image, self._dev)
-            horizon_row = int(self.cy)
-            mask[:horizon_row, :] = 0
-
-            # m = mask.astype(np.uint8) * 255
-            # mask_msg = self._cv_bridge.cv2_to_imgmsg(m, "mono8")
-            ####################
-            if self.multi_class:
-                # m = np.zeros_like(mask, dtype=np.uint8)
-                # m[mask == 1] = 127  # Adjacent lane
-                # m[mask == 2] = 255  # Ego lane
-
-                # kalil's version
-                m = np.choose(mask, (0, 127, 255)).astype(np.uint8)
-            else:
-                m = mask.astype(np.uint8) * 255
-
-            #########################
-
-            # mask_msg = self._cv_bridge.cv2_to_imgmsg(mask, encoding="bgr8")
-
-            mask_msg = self._cv_bridge.cv2_to_imgmsg(m, "mono8")
-            self.lane_mask_pub.publish(mask_msg)
 
     def _on_depth_image(self, msg: Image):
         """Callback for depth camera frames; publishes clean 2D depth (meters) as 32FC1."""
@@ -916,61 +415,6 @@ class PurePursuit(Node):
         return math.sqrt(
             (p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2 + (p1[2] - p2[2]) ** 2
         )
-
-    def turn_around_cone(self):
-        if self.cone_detected_coordinate is None:
-            return
-
-        # 1. Get current vehicle pose in map frame
-        curr_x, curr_y, curr_yaw = self.get_gem_state()
-
-        # 2. Extract cone coordinates in vehicle frame (X = front, Y = left)
-        cx_rel = self.cone_detected_coordinate[0]
-        cy_rel = self.cone_detected_coordinate[1]
-
-        # 3. Transform cone position from vehicle frame to map frame
-        cone_map_x = curr_x + cx_rel * math.cos(curr_yaw) - cy_rel * math.sin(curr_yaw)
-        cone_map_y = curr_y + cx_rel * math.sin(curr_yaw) + cy_rel * math.cos(curr_yaw)
-
-        # 4. Find the waypoint closest to the cone in the map frame
-        cone_dist_arr = [
-            math.hypot(
-                self.path_points_x[i] - cone_map_x, self.path_points_y[i] - cone_map_y
-            )
-            for i in range(len(self.path_points_x))
-        ]
-        closest_wp_idx = np.argmin(cone_dist_arr)
-
-        # 5. Define detour parameters around that waypoint index
-        num_waypoints_to_shift = 20  # Number of waypoints affected by the bypass curve
-        bypass_offset = 1.5  # Distance in meters to shift away from the cone
-
-        # Determine shift direction: if cone is to the left in vehicle frame (cy_rel > 0), shift right (-1); else shift left (+1)
-        shift_sign = -1.0 if cy_rel > 0 else 1.0
-
-        start_idx = max(0, closest_wp_idx - 5)  # Start slightly before the cone
-        end_idx = min(start_idx + num_waypoints_to_shift, len(self.path_points_x))
-
-        # 6. Apply a smooth lateral shift (using a sine bell curve) to upcoming waypoints
-        for i in range(start_idx, end_idx):
-            progress = (i - start_idx) / max(1, (end_idx - start_idx))
-            weight = math.sin(progress * math.pi)  # Peaks in the middle of the detour
-
-            # Compute normal vector perpendicular to the waypoint heading
-            yaw_rad = self.heading_to_yaw(self.path_points_heading[i])
-            nx = -math.sin(yaw_rad)  # Lateral X component (left normal)
-            ny = math.cos(yaw_rad)  # Lateral Y component (left normal)
-
-            # Shift the waypoint coordinates laterally in the map frame
-            self.path_points_x[i] += shift_sign * bypass_offset * weight * nx
-            self.path_points_y[i] += shift_sign * bypass_offset * weight * ny
-
-        self.get_logger().warn(
-            f"Cone avoided! Shifted waypoints around cone at map coords ({cone_map_x:.2f}, {cone_map_y:.2f})"
-        )
-
-        # Clear the coordinate so the car doesn't keep modifying the path on every tick
-        self.cone_detected_coordinate = None
 
     def front2steer(self, f_angle):
         f_angle = max(min(f_angle, 35), -35)
@@ -1076,6 +520,7 @@ class PurePursuit(Node):
         joy_enable = self.check_joystick_enable()
 
         curr_x, curr_y, curr_yaw = self.get_gem_state()
+
         self.publish_local_odom(curr_x, curr_y, curr_yaw)
 
         if joy_enable == 1 and not self.pacmod_enable:
@@ -1269,53 +714,6 @@ class PurePursuit(Node):
         self.get_logger().info("Destroying PurePursuit node")
         super().destroy_node()
 
-    def load_model(self, path_to_your_model: str) -> SimpleENet:
-        # model = SimpleENet()
-        # model.load_state_dict(torch.load(path_to_your_model, weights_only=True))
-        # return model
-        model = SimpleENet(num_classes=3)
-        model.load_state_dict(
-            torch.load(path_to_your_model, map_location="cpu", weights_only=True)
-        )
-        return model.eval()
-
-    def inference(
-        self, model: SimpleENet, image: np.ndarray, device: str
-    ) -> np.ndarray:
-        # resized = cv2.resize(image, (640, 384))
-        # gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-        # image = gray.astype(np.float32) / 255.0
-        # image = torch.from_numpy(image)
-        # image = image.unsqueeze(0)
-        # image = image.unsqueeze(0)
-        # image = image.to(device)
-        # prediction = model(image)
-        # prediction = torch.argmax(prediction, dim=1)
-        # prediction = prediction.squeeze(0).cpu().numpy()
-        # prediction = (prediction * 255).astype(np.float32)
-        # prediction = cv2.resize(prediction, (800, 600))
-        # return prediction
-        resized_image = cv2.resize(image, (640, 384))
-        gray_scale_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2GRAY)
-        normalize_image = gray_scale_image.astype("float32") / 255.0
-
-        # Correct tensor shape: [1, 1, 384, 640]
-        image_tensor = torch.from_numpy(normalize_image).float()
-        inputs = image_tensor.unsqueeze(0).unsqueeze(0).to(device)
-
-        set_model = model.to(device).eval()
-
-        with torch.inference_mode():
-            output = set_model(inputs)
-
-        predicted_class = torch.argmax(output, dim=1)
-        resized_prediction = torch.nn.functional.interpolate(
-            predicted_class.unsqueeze(1).float(),
-            size=(image.shape[0], image.shape[1]),
-            mode="nearest",
-        )
-        return resized_prediction.squeeze(0).squeeze(0).cpu().numpy().astype(np.uint8)
-
 
 def main(args=None):
 
@@ -1334,3 +732,5 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+
+# Three versions, lane assist verion, 2 depth versions one with car depth and the other depth anything
