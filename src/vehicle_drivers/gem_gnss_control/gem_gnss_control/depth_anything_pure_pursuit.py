@@ -2,7 +2,8 @@
 
 # ================================================================
 # Description: Pure pursuit for GEM. Waypoints come from the front
-#   camera (lane keeping) and the depth topic. GPS is used only to
+#   camera: lane keeping on each RGB frame, with depth from
+#   Depth-Anything-V2 run on the same frame. GPS is used only to
 #   record the start point and to finish once the vehicle is back
 #   within stop_distance of it.
 # Author: Zillur Rahman, Jiaming Zhang, Hang Cui, Dimitry
@@ -68,13 +69,16 @@ try:
     HAS_LOCAL_DEPTH_ANYTHING = True
 except ImportError:
     HAS_LOCAL_DEPTH_ANYTHING = False
-# GPS finish is armed only after the vehicle leaves this radius around the
-# start point, so the program does not finish at the start. Not a ROS parameter.
-START_ZONE_RADIUS = 5.0
+
 weights_path = (
     "/home/dermakov/Documents/fa26_ece484_mp1_team_cobbledtogether_group_52/"
     "Depth-Anything-V2/checkpoints/depth_anything_v2_vits.pth"
 )
+
+# GPS finish is armed only after the vehicle leaves this radius around the
+# start point, so the program does not finish at the start. Not a ROS parameter.
+START_ZONE_RADIUS = 5.0
+
 # Initialize pygame for joystick
 pygame.init()
 pygame.joystick.init()
@@ -235,6 +239,8 @@ class PurePursuit(Node):
         self.declare_parameter("depth_output_topic", "/depth_image_output_ADD")
         self.depth_output_topic = self.get_parameter("depth_output_topic").value
 
+        # Declared for compatibility only. Depth now comes from Depth-Anything-V2
+        # on the camera frame, so this topic is not subscribed.
         self.declare_parameter("depth_camera_topic", "/oak/stereo/image_raw")
         self.depth_camera_topic = self.get_parameter("depth_camera_topic").value
 
@@ -254,10 +260,10 @@ class PurePursuit(Node):
         )
 
         self._cv_bridge = CvBridge()
-        self._depth_m = None
         self._dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # --- Depth-Anything-V2 (vits), loaded once from local weights ---
         self._depth_model = None
-        self._depth_msg = None
 
         if HAS_LOCAL_DEPTH_ANYTHING:
             try:
@@ -275,11 +281,9 @@ class PurePursuit(Node):
                     self._depth_model.load_state_dict(
                         torch.load(weights_path, map_location="cpu")
                     )
-
                     self._depth_model = self._depth_model.to(self._dev).eval()
-
                     self.get_logger().info(
-                        "[green]Loaded local Depth Anything V2 model successfully offline![/green]"
+                        "Loaded local Depth Anything V2 model successfully offline"
                     )
                 else:
                     self.get_logger().error(
@@ -303,9 +307,6 @@ class PurePursuit(Node):
         self.path_points_y = np.array([])
         self.waypoint_pixels = []
 
-        self.create_subscription(
-            Image, self.depth_camera_topic, self._on_depth_image, 10
-        )
         self.depth_pub = self.create_publisher(Image, self.depth_output_topic, 10)
 
         self.lane_fit_pub = self.create_publisher(Image, self.lane_fit_topic, 10)
@@ -394,7 +395,6 @@ class PurePursuit(Node):
         self.max_stop_brake = 0.7
         self.kick_start_active = False
         self.kick_start_end_time = 0.0
-        self._dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.timer = self.create_timer(1.0 / self.rate_hz, self.control_loop)
 
@@ -532,7 +532,7 @@ class PurePursuit(Node):
             self.get_logger().warn("No lane detected", throttle_duration_sec=2.0)
             return [], []
 
-        # Scale depth lookups if the depth image resolution differs from the RGB image
+        # Scale depth lookups if the depth map resolution differs from the RGB image
         if depth_map is not None and getattr(depth_map, "ndim", 0) == 2:
             sx = depth_map.shape[1] / self._img_width
             sy = depth_map.shape[0] / self._img_height
@@ -561,17 +561,34 @@ class PurePursuit(Node):
         self.path_points_y = np.array([])
         self.waypoint_pixels = []
 
+    def _estimate_depth(self, image, header):
+        """Run Depth-Anything-V2 on a BGR frame. Returns an HxW float32 depth map,
+        or None if the model is not loaded. The map is also published on
+        depth_output_topic for debugging.
+        """
+        if self._depth_model is None:
+            return None
+
+        depth = np.asarray(self._depth_model.infer_image(image), dtype=np.float32)
+        if depth.ndim != 2 or not np.any(np.isfinite(depth)):
+            self.get_logger().warn(
+                "Depth-Anything-V2 returned an invalid depth map",
+                throttle_duration_sec=2.0,
+            )
+            return None
+
+        out_msg = self._cv_bridge.cv2_to_imgmsg(depth, encoding="32FC1")
+        out_msg.header = header
+        self.depth_pub.publish(out_msg)
+
+        return depth
+
     def _on_camera_image(self, msg):
-        """Front camera frame -> lane detection -> vehicle-frame waypoints."""
+        """Front camera frame -> lane detection and Depth-Anything-V2 -> vehicle-frame waypoints."""
         self.get_logger().info(
             f"Received RGB image | Width: {msg.width}, Height: {msg.height}",
             throttle_duration_sec=2.0,
         )
-
-        # Wait for depth before generating waypoints
-        if self._depth_m is None:
-            self._clear_waypoints()
-            return
 
         image = self._cv_bridge.imgmsg_to_cv2(msg, "bgr8")
 
@@ -580,10 +597,15 @@ class PurePursuit(Node):
             self._clear_waypoints()
             return
 
+        depth_map = self._estimate_depth(image, msg.header)
+        if depth_map is None:
+            self._clear_waypoints()
+            return
+
         desired_lane, _ = self._lane_keeper.lane_keeping(lane_det_results)
 
         waypoints, self.waypoint_pixels = self.desired_lane_to_waypoints(
-            desired_lane, self._depth_m
+            desired_lane, depth_map
         )
         if not waypoints:
             self._clear_waypoints()
@@ -592,34 +614,6 @@ class PurePursuit(Node):
         wp = np.asarray(waypoints, dtype=float)
         self.path_points_x = wp[:, 0]
         self.path_points_y = wp[:, 1]
-
-    def _on_depth_image(self, msg: Image):
-        """Depth camera frames; stores clean 2D depth in meters and republishes as 32FC1."""
-        self.get_logger().info(
-            f"Received depth image | Encoding: {msg.encoding}",
-            throttle_duration_sec=2.0,
-        )
-
-        if msg.encoding == "16UC1":
-            raw = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding="16UC1")
-            depth_m = raw.astype(np.float32) / 1000.0
-            depth_m[raw == 0] = np.nan
-        elif msg.encoding == "32FC1":
-            raw = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
-            depth_m = raw.astype(np.float32).copy()
-            depth_m[~np.isfinite(depth_m) | (depth_m <= 0.0)] = np.nan
-        else:
-            self.get_logger().warn(f"Unsupported depth encoding: {msg.encoding}")
-            return
-
-        # Clip absurd stereo noise/outliers for waypoint generation
-        depth_m[depth_m > 30.0] = np.nan
-
-        self._depth_m = depth_m
-
-        out_msg = self._cv_bridge.cv2_to_imgmsg(depth_m, encoding="32FC1")
-        out_msg.header = msg.header
-        self.depth_pub.publish(out_msg)
 
     def _on_lidar_points(self, msg):
         """Callback for 3D LiDAR point cloud data."""
