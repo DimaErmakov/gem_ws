@@ -7,7 +7,6 @@
 # ================================================================
 
 import os
-import csv
 import math
 import numpy as np
 from numpy import linalg as la
@@ -132,11 +131,11 @@ class PurePursuit(Node):
         self.declare_parameter("origin_lon", -88.2359639)
         self.declare_parameter("desired_speed", 2.6)
         self.declare_parameter("max_accel", 0.5)
-        self.declare_parameter("waypoints_file", "e4_track.csv")
         self.declare_parameter("stop_distance", 2.0)
 
         self.declare_parameter("kick_start_accel", 0.3)
         self.declare_parameter("kick_start_duration", 1.0)
+
         self.declare_parameter(
             "kick_start_speed_threshold", 0.15
         )  # 0.1 in config? TODO
@@ -291,8 +290,6 @@ class PurePursuit(Node):
             angular_position=0.0, angular_velocity_limit=4.0
         )
 
-        self.read_waypoints()
-
         # Initialize
         self.object_detected = False
         self.object_detected_coordinate = None
@@ -300,6 +297,9 @@ class PurePursuit(Node):
         self.cone_detected_coordinate = None
         self.lat = 0.0
         self.lon = 0.0
+        self.start_lat = 0.0
+        self.start_lon = 0.0
+
         self.heading = 0.0
         self.speed = 0.0
         self.gem_enable = False
@@ -367,14 +367,14 @@ class PurePursuit(Node):
 
     def get_depth_at(
         self,
-        depth_image: np.ndarray | None,
-        u: float,
-        v: float,
-        default_depth: float = 2.0,
-        min_depth: float = 0.05,
-        max_depth: float | None = None,
-        window_size: int = 1,
-    ) -> float:
+        depth_image,
+        u,
+        v,
+        default_depth=2.0,
+        min_depth=0.05,
+        max_depth=None,
+        window_size=1,
+    ):
 
         if depth_image is None or getattr(depth_image, "ndim", 0) != 2:
             self.get_logger().warn(
@@ -500,28 +500,6 @@ class PurePursuit(Node):
         self._lidar_msg = msg
         self.object_detected, self.cone_detected = self.detect_objects_and_cones(5.0)
 
-    def read_waypoints(self):
-        waypoints_file = self.get_parameter("waypoints_file").value
-        if os.path.isabs(waypoints_file):
-            filename = waypoints_file
-        else:
-            # os.path.realpath() resolves through the symlink that
-            # `colcon build --symlink-install` creates for this module file,
-            # so this ends up pointing at waypoints/ in the source checkout
-            # (src/.../gem_gnss_control/waypoints) instead of a copy inside
-            # build/ or install/.
-            dirname = os.path.dirname(os.path.realpath(__file__))
-            filename = os.path.join(dirname, "../waypoints", waypoints_file)
-        self.get_logger().info(f"self.wheelbase: {self.wheelbase}")
-        self.get_logger().info(f"self.look_ahead: {self.look_ahead}")
-        self.get_logger().info(f"Loading waypoints from: {filename}")
-        with open(filename) as f:
-            path_points = [tuple(line) for line in csv.reader(f)]
-        self.path_points_lon_x = [float(p[0]) for p in path_points]
-        self.path_points_lat_y = [float(p[1]) for p in path_points]
-        self.path_points_heading = [float(p[2]) for p in path_points]
-        self.wp_size = len(self.path_points_lon_x)
-
     def heading_to_yaw(self, heading):
         return np.radians(90 - heading) if heading < 270 else np.radians(450 - heading)
 
@@ -564,6 +542,7 @@ class PurePursuit(Node):
         return 2
 
     def get_gem_state(self):
+        # only use for detecting if finished
         local_x, local_y = self.wps_to_local_xy(self.lon, self.lat)
         yaw = self.heading_to_yaw(self.heading)
         x = local_x - self.offset * math.cos(yaw)
@@ -680,7 +659,6 @@ class PurePursuit(Node):
         elif joy_enable != 0 and self.pacmod_enable:
             self.path_points_x = np.array(self.path_points_lon_x)
             self.path_points_y = np.array(self.path_points_lat_y)
-            # print(f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})")
             self.get_logger().info(
                 f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})"
             )
@@ -765,7 +743,7 @@ class PurePursuit(Node):
                 if self.dist_arr[i] > ld:
                     self.goal = i
                     break
-
+            # TODO
             target_x = self.path_points_x[self.goal]
             target_y = self.path_points_y[self.goal]
             target_yaw = self.path_points_heading[self.goal]
