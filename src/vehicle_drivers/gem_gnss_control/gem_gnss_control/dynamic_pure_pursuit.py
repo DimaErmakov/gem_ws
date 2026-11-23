@@ -203,7 +203,6 @@ class PurePursuit(Node):
         self.create_subscription(
             Image, self.depth_camera_topic, self._on_depth_image, 10
         )
-        self.lane_mask_pub = self.create_publisher(Image, self.lane_mask_topic, 10)
         self.depth_pub = self.create_publisher(Image, self.depth_output_topic, 10)
 
         # Subscriptions
