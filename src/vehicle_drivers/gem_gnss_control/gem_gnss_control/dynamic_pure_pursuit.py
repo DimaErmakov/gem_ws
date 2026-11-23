@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
 # ================================================================
-# Description: edited 11/19
+# Description: Pure pursuit for GEM. Waypoints come from the front
+#   camera (lane keeping) and the depth topic. GPS is used only to
+#   record the start point and to finish once the vehicle is back
+#   within stop_distance of it.
 # Author: Zillur Rahman, Jiaming Zhang, Hang Cui, Dimitry
 # Date: 2026-09-03
 # ================================================================
@@ -29,8 +32,6 @@ from pacmod2_msgs.msg import (
     SystemRptInt,
 )
 
-# "/home/gem/gem_ws_gem_or_death/src/vehicle_drivers/gem_gnss_control/gem_gnss_control/blob_with_color.pth",
-# NEW IMPORTS
 from sensor_msgs.msg import CameraInfo, Image, NavSatFix, PointCloud2
 from septentrio_gnss_driver.msg import INSNavGeod
 from nav_msgs.msg import Odometry, Path
@@ -56,6 +57,10 @@ LaneKeeping_DIR = (
 if LaneKeeping_DIR not in sys.path:
     sys.path.append(LaneKeeping_DIR)
 from lanekeeping import LaneKeeping
+
+# GPS finish is armed only after the vehicle leaves this radius around the
+# start point, so the program does not finish at the start. Not a ROS parameter.
+START_ZONE_RADIUS = 5.0
 
 # Initialize pygame for joystick
 pygame.init()
@@ -136,9 +141,7 @@ class PurePursuit(Node):
         self.declare_parameter("kick_start_accel", 0.3)
         self.declare_parameter("kick_start_duration", 1.0)
 
-        self.declare_parameter(
-            "kick_start_speed_threshold", 0.15
-        )  # 0.1 in config? TODO
+        self.declare_parameter("kick_start_speed_threshold", 0.10)
 
         self.declare_parameter("pid/kp", 0.6)
         self.declare_parameter("pid/ki", 0.0)
@@ -222,13 +225,34 @@ class PurePursuit(Node):
         self.declare_parameter("depth_camera_topic", "/oak/stereo/image_raw")
         self.depth_camera_topic = self.get_parameter("depth_camera_topic").value
 
+        self.declare_parameter("lane_fit_topic", "/lane_fit_topic_ADD")
+        self.lane_fit_topic = self.get_parameter("lane_fit_topic").value
+
+        # Lane detection and keeping are created once here, not per frame
+        self._lane_keeper = LaneKeeping(
+            self._img_width,
+            self._img_height,
+            logging.getLogger("LaneKeeping"),
+        )
+        self._lane_detector = LaneDetection(
+            self._img_width,
+            self._img_height,
+            self._lane_keeper,
+        )
+
+        self._cv_bridge = CvBridge()
+        self._depth_m = None
+
+        # Latest camera-derived waypoints in vehicle frame (x forward, y left), near to far
+        self.path_points_x = np.array([])
+        self.path_points_y = np.array([])
+        self.waypoint_pixels = []
+
         self.create_subscription(
             Image, self.depth_camera_topic, self._on_depth_image, 10
         )
         self.depth_pub = self.create_publisher(Image, self.depth_output_topic, 10)
 
-        self.declare_parameter("lane_fit_topic", "/lane_fit_topic_ADD")
-        self.lane_fit_topic = self.get_parameter("lane_fit_topic").value
         self.lane_fit_pub = self.create_publisher(Image, self.lane_fit_topic, 10)
 
         # Subscriptions
@@ -254,7 +278,6 @@ class PurePursuit(Node):
         self.create_subscription(
             GlobalRpt, "/pacmod/global_rpt", self.global_rpt_callback, 10
         )
-        # Sensor Subscriptions based on parsed arguments
         self.create_subscription(Image, self.camera_topic, self._on_camera_image, 10)
         self.create_subscription(
             PointCloud2, self.lidar_topic, self._on_lidar_points, 10
@@ -295,10 +318,15 @@ class PurePursuit(Node):
         self.object_detected_coordinate = None
         self.cone_detected = False
         self.cone_detected_coordinate = None
+
+        # GPS state: used only for the start point and the finish check
         self.lat = 0.0
         self.lon = 0.0
         self.start_lat = 0.0
         self.start_lon = 0.0
+        self.start_recorded = False
+        self.left_start_zone = False
+        self.finished = False
 
         self.heading = 0.0
         self.speed = 0.0
@@ -313,16 +341,31 @@ class PurePursuit(Node):
         self.kick_start_end_time = 0.0
         self._dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._cv_bridge = CvBridge()
-        self.dist_arr = np.zeros(len(self.path_points_lon_x))
 
         self.timer = self.create_timer(1.0 / self.rate_hz, self.control_loop)
 
     def gnss_callback(self, msg):
         self.lat = msg.latitude
         self.lon = msg.longitude
+        if not self.start_recorded:
+            self.start_lat = self.lat
+            self.start_lon = self.lon
+            self.start_recorded = True
+            self.get_logger().info(
+                f"Start point recorded: lat {self.start_lat:.7f}, lon {self.start_lon:.7f}"
+            )
 
     def ins_callback(self, msg):
         self.heading = msg.heading
+
+    def dist_to_start(self):
+        """Distance in meters from the current GPS fix to the recorded start point."""
+        if not self.start_recorded:
+            return None
+        e, n, _ = pm.geodetic2enu(
+            self.lat, self.lon, 0.0, self.start_lat, self.start_lon, 0.0
+        )
+        return math.hypot(e, n)
 
     def speed_callback(self, msg):
         self.speed = self.speed_filter.get_data(msg.vehicle_speed)
@@ -424,8 +467,15 @@ class PurePursuit(Node):
         Returns the waypoints and the matching pixel locations for visualization.
         """
         if desired_lane is None:
-            print("No lane detected")
+            self.get_logger().warn("No lane detected", throttle_duration_sec=2.0)
             return [], []
+
+        # Scale depth lookups if the depth image resolution differs from the RGB image
+        if depth_map is not None and getattr(depth_map, "ndim", 0) == 2:
+            sx = depth_map.shape[1] / self._img_width
+            sy = depth_map.shape[0] / self._img_height
+        else:
+            sx = sy = 1.0
 
         rows = self._lane_keeper.plot_y  # bottom (near) to top (far)
         waypoints = []
@@ -434,40 +484,56 @@ class PurePursuit(Node):
         for u, v in zip(desired_lane, rows):
             if not (0 <= u < self._img_width):
                 continue
-            depth = self.get_depth_at(depth_map, u, v)
+            depth = self.get_depth_at(depth_map, u * sx, v * sy)
             x, y = self.pixel_to_vehicle_frame(u, v, depth)
             waypoints.append([float(x), float(y)])
             pixels.append((int(round(u)), int(round(v))))
 
         return waypoints, pixels
 
+    def _clear_waypoints(self):
+        self.path_points_x = np.array([])
+        self.path_points_y = np.array([])
+        self.waypoint_pixels = []
+
     def _on_camera_image(self, msg):
-        """Callback for standard RGB camera frames."""
+        """Front camera frame -> lane detection -> vehicle-frame waypoints."""
         self.get_logger().info(
             f"Received RGB image | Width: {msg.width}, Height: {msg.height}",
             throttle_duration_sec=2.0,
         )
-        self._image_msg = msg
-        lane_logger = logging.getLogger("LaneKeeping")
-        self._lane_keeper = LaneKeeping(
-            self._img_width,
-            self._img_height,
-            lane_logger,
+
+        # Wait for depth before generating waypoints
+        if self._depth_m is None:
+            self._clear_waypoints()
+            return
+
+        image = self._cv_bridge.imgmsg_to_cv2(msg, "bgr8")
+
+        lane_det_results = self._lane_detector.lanes_detection(image)
+        if lane_det_results is None:
+            self._clear_waypoints()
+            return
+
+        desired_lane, _ = self._lane_keeper.lane_keeping(lane_det_results)
+
+        waypoints, self.waypoint_pixels = self.desired_lane_to_waypoints(
+            desired_lane, self._depth_m
         )
-        self._lane_detector = LaneDetection(
-            self._img_width,
-            self._img_height,
-            self._lane_keeper,
-        )
-        # TODO
+        if not waypoints:
+            self._clear_waypoints()
+            return
+
+        wp = np.asarray(waypoints, dtype=float)
+        self.path_points_x = wp[:, 0]
+        self.path_points_y = wp[:, 1]
 
     def _on_depth_image(self, msg: Image):
-        """Callback for depth camera frames; publishes clean 2D depth (meters) as 32FC1."""
+        """Depth camera frames; stores clean 2D depth in meters and republishes as 32FC1."""
         self.get_logger().info(
             f"Received depth image | Encoding: {msg.encoding}",
             throttle_duration_sec=2.0,
         )
-        self._depth_msg = msg
 
         if msg.encoding == "16UC1":
             raw = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding="16UC1")
@@ -478,13 +544,12 @@ class PurePursuit(Node):
             depth_m = raw.astype(np.float32).copy()
             depth_m[~np.isfinite(depth_m) | (depth_m <= 0.0)] = np.nan
         else:
-            self.get_logger().warning(f"Unsupported depth encoding: {msg.encoding}")
+            self.get_logger().warn(f"Unsupported depth encoding: {msg.encoding}")
             return
 
-        # Optional: clip absurd stereo noise/outliers for waypoint generation
+        # Clip absurd stereo noise/outliers for waypoint generation
         depth_m[depth_m > 30.0] = np.nan
 
-        # Store the 2D (H, W) array in meters
         self._depth_m = depth_m
 
         out_msg = self._cv_bridge.cv2_to_imgmsg(depth_m, encoding="32FC1")
@@ -492,7 +557,7 @@ class PurePursuit(Node):
         self.depth_pub.publish(out_msg)
 
     def _on_lidar_points(self, msg):
-        """Callback for 3D LiDAR point cloud data (/scan/points)."""
+        """Callback for 3D LiDAR point cloud data."""
         self.get_logger().info(
             f"Received PointCloud2 | Frame ID: {msg.header.frame_id}, Points: {len(msg.data)} bytes",
             throttle_duration_sec=2.0,
@@ -502,10 +567,6 @@ class PurePursuit(Node):
 
     def heading_to_yaw(self, heading):
         return np.radians(90 - heading) if heading < 270 else np.radians(450 - heading)
-
-    def wps_to_local_xy(self, lon, lat):
-        x, y, _ = pm.geodetic2enu(lat, lon, 0, self.olat, self.olon, 0)
-        return x, y
 
     def dist(self, p1, p2):
         return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
@@ -541,14 +602,6 @@ class PurePursuit(Node):
         # others
         return 2
 
-    def get_gem_state(self):
-        # only use for detecting if finished
-        local_x, local_y = self.wps_to_local_xy(self.lon, self.lat)
-        yaw = self.heading_to_yaw(self.heading)
-        x = local_x - self.offset * math.cos(yaw)
-        y = local_y - self.offset * math.sin(yaw)
-        return x, y, yaw
-
     # function to detect if the lidar sees something too close to the car
     def detect_objects_and_cones(self, threshold=5.0):
         points = point_cloud2.read_points_list(
@@ -577,7 +630,6 @@ class PurePursuit(Node):
                     first_point = point
                 print("Close object detected at point:", point)
                 self.get_logger().info(f"Close object detected at point: {point}")
-                self.get_logger().info("Close object detected at point:", point)
 
                 # Veto cone detection if ANY point in the zone is above the height threshold
                 if point[2] >= self.height_of_cones_theshold:
@@ -613,6 +665,7 @@ class PurePursuit(Node):
         pt = PointStamped()
         pt.header.stamp = self.get_clock().now().to_msg()
         pt.header.frame_id = "map"
+        # pt.header.frame_id = "base_link"
         pt.point.x = x
         pt.point.y = y
         self.target_point_pub.publish(pt)
@@ -620,12 +673,12 @@ class PurePursuit(Node):
     def control_loop(self):
         joy_enable = self.check_joystick_enable()
 
-        curr_x, curr_y, curr_yaw = self.get_gem_state()
+        # curr_x, curr_y, curr_yaw = self.get_gem_state()
 
-        self.publish_local_odom(curr_x, curr_y, curr_yaw)
+        # self.publish_local_odom(curr_x, curr_y, curr_yaw)
 
         if joy_enable == 1 and not self.pacmod_enable:
-            # joystick enable when vehicle disbaled
+            # joystick enable when vehicle disabled
             self.global_cmd.enable = True
             self.global_cmd.clear_override = True
             self.global_pub.publish(self.global_cmd)
@@ -644,7 +697,7 @@ class PurePursuit(Node):
             )
 
         elif joy_enable == 0 and self.pacmod_enable:
-            # joystick disable when vehicle enbaled
+            # joystick disable when vehicle enabled
             self.global_cmd.enable = False
 
             self.turn_cmd.command = 1
@@ -657,18 +710,37 @@ class PurePursuit(Node):
             self.get_logger().warn("Joystick Disabled, Pacmod disabled")
 
         elif joy_enable != 0 and self.pacmod_enable:
-            self.path_points_x = np.array(self.path_points_lon_x)
-            self.path_points_y = np.array(self.path_points_lat_y)
-            self.get_logger().info(
-                f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})"
-            )
-            # Check distance to the FINAL waypoint in the track
-            end_x = self.path_points_x[-1]
-            end_y = self.path_points_y[-1]
-            dist_to_end = self.dist((end_x, end_y), (curr_x, curr_y))
+            # self.path_points_x = np.array(self.path_points_lon_x)
+            # self.path_points_y = np.array(self.path_points_lat_y)
+            # self.get_logger().info(
+            #     f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})"
+            # )
+            # # Check distance to the FINAL waypoint in the track
+            # end_x = self.path_points_x[-1]
+            # end_y = self.path_points_y[-1]
+            # dist_to_end = self.dist((end_x, end_y), (curr_x, curr_y))
 
-            # Trigger stopping sequence if close to final waypoint or already in stopping sequence
-            if dist_to_end <= self.stop_dist_threshold or self.is_stopping:
+            # # Trigger stopping sequence if close to final waypoint or already in stopping sequence
+            # if dist_to_end <= self.stop_dist_threshold or self.is_stopping:
+            if self.finished:
+                return
+
+            # GPS finish check: arm after leaving the start zone, then stop near start
+            dist_to_start = self.dist_to_start()
+            if dist_to_start is not None and not self.left_start_zone:
+                if dist_to_start > START_ZONE_RADIUS:
+                    self.left_start_zone = True
+                    self.get_logger().info(
+                        f"Left start zone ({dist_to_start:.2f}m). Finish armed."
+                    )
+            at_start = (
+                self.left_start_zone
+                and dist_to_start is not None
+                and dist_to_start <= self.stop_dist_threshold
+            )
+
+            # Trigger stopping sequence at the start point or if already stopping
+            if at_start or self.is_stopping:
                 now_sec = self.get_clock().now().nanoseconds * 1e-9
 
                 # First iteration entering stop state
@@ -677,7 +749,7 @@ class PurePursuit(Node):
                     self.stop_start_time = now_sec
                     self.pid_speed.reset()
                     self.get_logger().warn(
-                        f"Final waypoint reached ({dist_to_end:.2f}m). Initiating smooth braking sequence..."
+                        f"Start point reached ({dist_to_start:.2f}m). Initiating smooth braking sequence..."
                     )
 
                 # Elapsed time since stopping triggered
@@ -687,7 +759,7 @@ class PurePursuit(Node):
                 self.accel_cmd.command = 0.0
                 self.accel_pub.publish(self.accel_cmd)
 
-                # 2. Smoothly ramp brake from 0.0 to 0.5 max over ramp_duration (2.0s)
+                # 2. Smoothly ramp brake from 0.0 to max over ramp_duration
                 brake_target = min(
                     self.max_stop_brake,
                     self.max_stop_brake * (elapsed / self.ramp_duration),
@@ -699,14 +771,14 @@ class PurePursuit(Node):
                 self.steer_cmd.angular_position = 0.0
                 self.steer_pub.publish(self.steer_cmd)
 
-                # 4. Gear shifting logic: Keep FORWARD (3) while moving, shift to NEUTRAL (2) once stationary
+                # 4. Keep FORWARD while moving, shift to NEUTRAL once stopped
                 if self.speed < 0.05:  # Vehicle is fully stopped
                     self.gear_cmd.command = 2  # NEUTRAL
-                    self.get_logger().info(
-                        "Vehicle completely stopped. Gear shifted to NEUTRAL.",
-                        throttle_duration_sec=2.0,
+                    self.get_logger().warn(
+                        "Vehicle completely stopped. Gear shifted to NEUTRAL. Finishing program."
                     )
                     self.is_stopping = False
+                    self.finished = True
                 else:
                     self.gear_cmd.command = 3  # Keep FORWARD until stopped
                     self.get_logger().info(
@@ -722,33 +794,61 @@ class PurePursuit(Node):
 
                 return
 
-            # Shifting gear to drive if not already in drive
-            if self.current_gear != 3:  # FORWARD
-                # Only shift if current brake is above 50%
+            # Shift to FORWARD if not already in drive (driver presses brake above 50%)
+            if self.current_gear != 3:
                 self.get_logger().info(
                     f"Attempting to shift to FORWARD. Current brake: {self.current_brake:.2f}. Press brake above 50% to proceed."
                 )
                 if self.current_brake > 0.50:
                     self.gear_cmd.command = 3  # FORWARD
                     self.gear_pub.publish(self.gear_cmd)
+            # for i in range(self.wp_size):
+            #     self.dist_arr[i] = self.dist(
+            #         (self.path_points_x[i], self.path_points_y[i]), (curr_x, curr_y)
+            #     )
 
-            for i in range(self.wp_size):
-                self.dist_arr[i] = self.dist(
-                    (self.path_points_x[i], self.path_points_y[i]), (curr_x, curr_y)
+            # self.goal = np.argmin(self.dist_arr)
+            # ld = self.look_ahead + max(0.0, self.speed - 2.5) * 2
+            # for i in range(self.goal, self.wp_size):
+            #     if self.dist_arr[i] > ld:
+            #         self.goal = i
+            #         break
+            # # TODO
+            # target_x = self.path_points_x[self.goal]
+            # target_y = self.path_points_y[self.goal]
+            # target_yaw = self.path_points_heading[self.goal]
+            # No lane this cycle: no throttle, keep PACMod enabled
+            if self.path_points_x.size == 0:
+                self.get_logger().warn(
+                    "No lane waypoints this cycle", throttle_duration_sec=1.0
                 )
+                self.accel_cmd.command = 0.0
+                self.accel_pub.publish(self.accel_cmd)
+                self.brake_cmd.command = max(0.0, min(self.brake_value, 0.8))
+                self.brake_pub.publish(self.brake_cmd)
+                self.global_cmd.enable = True
+                self.global_pub.publish(self.global_cmd)
+                return
 
-            self.goal = np.argmin(self.dist_arr)
+            # Pure pursuit in vehicle frame: the car is at the origin with yaw 0,
+            # so waypoints (x forward, y left, near to far) are used directly.
+            path_x = self.path_points_x
+            path_y = self.path_points_y
+            wp_size = len(path_x)
+            dists = np.hypot(path_x, path_y)
+
+            self.goal = int(np.argmin(dists))
             ld = self.look_ahead + max(0.0, self.speed - 2.5) * 2
-            for i in range(self.goal, self.wp_size):
-                if self.dist_arr[i] > ld:
+            for i in range(self.goal, wp_size):
+                if dists[i] > ld:
                     self.goal = i
                     break
-            # TODO
-            target_x = self.path_points_x[self.goal]
-            target_y = self.path_points_y[self.goal]
-            target_yaw = self.path_points_heading[self.goal]
+
+            target_x = float(path_x[self.goal])
+            target_y = float(path_y[self.goal])
             self.publish_target_point(target_x, target_y)
-            alpha = math.atan2(target_y - curr_y, target_x - curr_x) - curr_yaw
+            # alpha = math.atan2(target_y - curr_y, target_x - curr_x) - curr_yaw
+            alpha = math.atan2(target_y, target_x)
             curvature = 0.0 if self.speed < 0.2 else 2.0 * math.sin(alpha) / ld
             steering_angle = math.atan(self.wheelbase * curvature)
             steering_wheel_angle = self.front2steer(math.degrees(steering_angle))
@@ -777,7 +877,7 @@ class PurePursuit(Node):
                         f"{self.kick_start_duration:.1f}s to break static friction"
                     )
                 if now < self.kick_start_end_time:
-                    self.get_logger().info(f"Waiting for kick-start to complete")
+                    self.get_logger().info("Waiting for kick-start to complete")
                     throttle_cmd = self.kick_start_accel
                 else:
                     self.kick_start_active = False
@@ -795,7 +895,8 @@ class PurePursuit(Node):
             self.global_pub.publish(self.global_cmd)
 
             self.get_logger().info(
-                f"Current pose: ({curr_x:.2f}, {curr_y:.2f}, {curr_yaw:.2f}), Target: ({target_x:.2f}, {target_y:.2f}), Speed: {self.speed:.2f}, Throttle: {throttle_cmd:.2f}, Steering: {steering_wheel_angle:.2f}"
+                f"Target: ({target_x:.2f}, {target_y:.2f}), Speed: {self.speed:.2f}, "
+                f"Throttle: {throttle_cmd:.2f}, Steering: {steering_wheel_angle:.2f}"
             )
 
     def destroy_node(self):
@@ -821,7 +922,8 @@ def main(args=None):
     pure_pursuit = PurePursuit()
 
     try:
-        rclpy.spin(pure_pursuit)
+        while rclpy.ok() and not pure_pursuit.finished:
+            rclpy.spin_once(pure_pursuit, timeout_sec=0.05)
     except KeyboardInterrupt:
         pass
     finally:
@@ -832,5 +934,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-
-# Three versions, lane assist verion, 2 depth versions one with car depth and the other depth anything
