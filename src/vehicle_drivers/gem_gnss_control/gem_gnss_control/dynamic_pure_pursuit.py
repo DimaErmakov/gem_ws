@@ -340,7 +340,6 @@ class PurePursuit(Node):
         self.kick_start_active = False
         self.kick_start_end_time = 0.0
         self._dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self._cv_bridge = CvBridge()
 
         self.timer = self.create_timer(1.0 / self.rate_hz, self.control_loop)
 
@@ -469,7 +468,8 @@ class PurePursuit(Node):
 
     def desired_lane_to_waypoints(self, desired_lane, depth_map):
         """Convert the LaneKeeping desired lane (one pixel column per row) into
-        vehicle-frame waypoints ordered near to far.
+        vehicle-frame waypoints ordered near to far. Rows without valid depth
+        are dropped instead of being placed at a default distance.
 
         Returns the waypoints and the matching pixel locations for visualization.
         """
@@ -491,7 +491,10 @@ class PurePursuit(Node):
         for u, v in zip(desired_lane, rows):
             if not (0 <= u < self._img_width):
                 continue
-            depth = self.get_depth_at(depth_map, u * sx, v * sy)
+            # NaN default: pixels without valid depth are skipped below
+            depth = self.get_depth_at(depth_map, u * sx, v * sy, default_depth=np.nan)
+            if not np.isfinite(depth):
+                continue
             x, y = self.pixel_to_vehicle_frame(u, v, depth)
             waypoints.append([float(x), float(y)])
             pixels.append((int(round(u)), int(round(v))))
@@ -846,10 +849,15 @@ class PurePursuit(Node):
 
             self.goal = int(np.argmin(dists))
             ld = self.look_ahead + max(0.0, self.speed - 2.5) * 2
+            found = False
             for i in range(self.goal, wp_size):
                 if dists[i] > ld:
                     self.goal = i
+                    found = True
                     break
+
+            if not found and wp_size > 0:
+                self.goal = wp_size - 1
 
             target_x = float(path_x[self.goal])
             target_y = float(path_y[self.goal])
