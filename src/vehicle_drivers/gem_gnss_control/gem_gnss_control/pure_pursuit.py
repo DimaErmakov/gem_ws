@@ -221,11 +221,12 @@ class PurePursuit(Node):
         # self.declare_parameter("camera_info_topic", "/oak/rgb/camera_info")
         # self.camera_info_topic = self.get_parameter("camera_info_topic").value
 
-        self.declare_parameter("depth_output_topic", "/depth_image_output_ADD")
-        self.depth_output_topic = self.get_parameter("depth_output_topic").value
-
+        # TODO
         self.declare_parameter("depth_camera_topic", "/oak/stereo/image_raw")
         self.depth_camera_topic = self.get_parameter("depth_camera_topic").value
+
+        self.declare_parameter("depth_output_topic", "/depth_image_output_ADD")
+        self.depth_output_topic = self.get_parameter("depth_output_topic").value
 
         self.declare_parameter("lane_fit_topic", "/lane_fit_topic_ADD")
         self.lane_fit_topic = self.get_parameter("lane_fit_topic").value
