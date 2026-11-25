@@ -63,6 +63,7 @@ from lanekeeping import LaneKeeping
 # GPS finish is armed only after the vehicle leaves this radius around the
 # start point, so the program does not finish at the start. Not a ROS parameter.
 START_ZONE_RADIUS = 5.0
+NO_LANE_SPEED = 2.0
 
 # Initialize pygame for joystick
 pygame.init()
@@ -723,18 +724,7 @@ class PurePursuit(Node):
             self.get_logger().warn("Joystick Disabled, Pacmod disabled")
 
         elif joy_enable != 0 and self.pacmod_enable:
-            # self.path_points_x = np.array(self.path_points_lon_x)
-            # self.path_points_y = np.array(self.path_points_lat_y)
-            # self.get_logger().info(
-            #     f"Next waypoint: ({self.path_points_x[0]}, {self.path_points_y[0]})"
-            # )
-            # # Check distance to the FINAL waypoint in the track
-            # end_x = self.path_points_x[-1]
-            # end_y = self.path_points_y[-1]
-            # dist_to_end = self.dist((end_x, end_y), (curr_x, curr_y))
 
-            # # Trigger stopping sequence if close to final waypoint or already in stopping sequence
-            # if dist_to_end <= self.stop_dist_threshold or self.is_stopping:
             if self.finished:
                 return
 
@@ -815,27 +805,26 @@ class PurePursuit(Node):
                 if self.current_brake > 0.50:
                     self.gear_cmd.command = 3  # FORWARD
                     self.gear_pub.publish(self.gear_cmd)
-            # for i in range(self.wp_size):
-            #     self.dist_arr[i] = self.dist(
-            #         (self.path_points_x[i], self.path_points_y[i]), (curr_x, curr_y)
-            #     )
 
-            # self.goal = np.argmin(self.dist_arr)
-            # ld = self.look_ahead + max(0.0, self.speed - 2.5) * 2
-            # for i in range(self.goal, self.wp_size):
-            #     if self.dist_arr[i] > ld:
-            #         self.goal = i
-            #         break
-            # # TODO
-            # target_x = self.path_points_x[self.goal]
-            # target_y = self.path_points_y[self.goal]
-            # target_yaw = self.path_points_heading[self.goal]
-            # No lane this cycle: no throttle, keep PACMod enabled
+            # No lane this cycle: hold the last steering angle and slow to NO_LANE_SPEED
             if self.path_points_x.size == 0:
                 self.get_logger().warn(
-                    "No lane waypoints this cycle", throttle_duration_sec=1.0
+                    "No lane waypoints this cycle, holding course and slowing",
+                    throttle_duration_sec=1.0,
                 )
-                self.accel_cmd.command = 0.0
+
+                # Republish the last steering command to maintain course
+                self.steer_pub.publish(self.steer_cmd)
+
+                # Hold a reduced target speed (never zero) through the speed PID
+                now = self.get_clock().now().nanoseconds * 1e-9
+                speed_error = NO_LANE_SPEED - self.speed
+                if abs(speed_error) < 0.05:
+                    speed_error = 0.0
+                throttle_cmd = self.pid_speed.get_control(now, speed_error)
+                throttle_cmd = max(0.0, min(throttle_cmd, self.max_accel))
+
+                self.accel_cmd.command = throttle_cmd
                 self.accel_pub.publish(self.accel_cmd)
                 self.brake_cmd.command = max(0.0, min(self.brake_value, 0.8))
                 self.brake_pub.publish(self.brake_cmd)
